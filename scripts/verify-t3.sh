@@ -56,6 +56,6 @@ runner = f'''
 (output / 'Checks.swift').write_text(tests + shim + runner)
 PY
 
-swiftc -parse-as-library -I .build/debug/Modules "$t3_temp/Checks.swift" \
+swiftc -parse-as-library -I .build/debug -I .build/debug/Modules "$t3_temp/Checks.swift" \
     .build/debug/WLKit.build/*.o -o "$t3_temp/check"
 "$t3_temp/check"

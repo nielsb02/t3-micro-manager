@@ -9,7 +9,7 @@ cleanup() {
     rm -rf "$verification_dir"
 }
 trap cleanup EXIT
-swiftc -parse-as-library -I .build/debug/Modules scripts/verify-desktop.swift .build/debug/WLKit.build/*.o -o "$verification_dir/verify"
+swiftc -parse-as-library -I .build/debug -I .build/debug/Modules scripts/verify-desktop.swift .build/debug/WLKit.build/*.o -o "$verification_dir/verify"
 swiftc scripts/desktop-launch-fixture.swift -o "$verification_dir/desktop-fixture"
 python3 scripts/desktop-test-server.py "$verification_dir" &
 fixture_pid=$!
