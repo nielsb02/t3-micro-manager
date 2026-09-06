@@ -6,8 +6,9 @@ sidebar ordering do not affect the destination. It does not open browser tabs.
 
 ## Local setup
 
-1. Build T3 with `patches/t3code-open-thread.patch`, or use the supplied custom
-   desktop build. Quit the stock T3 app before opening the custom build. They
+1. Download the Apple Silicon app from the
+   [T3 Micro fork's releases](https://github.com/nielsb02/t3code/releases/latest),
+   or build T3 with `patches/t3code-open-thread.patch`. Quit the stock T3 app before opening the custom build. They
    use the same T3 application identity and normal data directory.
 2. Open the updated Micro Manager. In **Configure → Connection**, select
    **Open sessions in → T3 desktop app**.
@@ -36,6 +37,14 @@ older ad-hoc builds. Changing the desktop target does not require applying new
 key bindings.
 
 ## Build the T3 patch
+
+The maintained source is [nielsb02/t3code](https://github.com/nielsb02/t3code).
+It checks published upstream releases daily and publishes a new desktop build
+after merging and passing checks. Conflicts or failed checks leave the previous
+download available. See its
+[maintenance guide](https://github.com/nielsb02/t3code/blob/main/docs/operations/micro-fork.md)
+for the schedule, installation, and update recovery. The standalone patch below
+remains available to reproduce the original integration.
 
 The patch targets upstream commit
 `223ff4490f764a74ff911589e97b9bbcd595fee8` (T3 version 0.0.38 plus subsequent
