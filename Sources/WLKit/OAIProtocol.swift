@@ -49,8 +49,8 @@ public enum OAI {
         }
     }
 
-    /// One key. `id` is a key index: 0-based, row-major over the pad's
-    /// [2, 4, 4, 3] matrix, so the top two rows are ids 0...5.
+    /// A firmware AG slot. Slot N lights whichever switches carry KV_OAI_AGNN.
+    /// Physical switch indices and AG slot IDs can differ; LayerMapping translates them.
     public struct Thread: Equatable, Sendable {
         public var id: Int
         public var color: Int?
@@ -120,8 +120,7 @@ public enum OAI {
         public static let dark = Zone(effect: .off, brightness: 0, speed: 0.5, magic: 1, color: 0)
     }
 
-    /// An AG key reports itself by name, "AG00".."AG19"; the number is the key
-    /// index, the same one used as a thread id for lighting.
+    /// An AG key reports its bound slot, "AG00".."AG19", also used for lighting.
     public static func agIndex(_ name: String?) -> Int? {
         guard let name, name.hasPrefix("AG") else { return nil }
         return Int(name.dropFirst(2))
@@ -151,19 +150,11 @@ public enum Pad {
     /// The firmware's keycode table goes to AG19, so clear the whole id space
     /// when turning everything off, not just the visible keys.
     public static let maxThreadID = 19
-    /// Agent slot N lights and answers to `agentKeyIDs[N]`, in READING order:
-    /// left to right, top to bottom as you look at the pad. The firmware's top
-    /// row is wired right to left — key 0 is the top-RIGHT key — so reading
-    /// order starts 1, 0. The other rows run left to right in index order.
-    public static let agentKeyIDs = [1, 0, 2, 3, 4, 5]
-    /// The rows as you look at the pad, for on-screen mirrors. `rows` stays in
-    /// firmware order because the keymap file is addressed that way.
-    public static let displayRows: [[Int]] = [
-        [1, 0],
-        [2, 3, 4, 5],
-        [6, 7, 8, 9],
-        [10, 11, 12],
-    ]
+    /// Default session switches in reading order. Their AG slots come from the keymap.
+    public static let agentKeyIDs = [0, 1, 2, 3, 4, 5]
+    /// Work Louder Input renders keymap[0][0] on the left and [0][1] on the right.
+    /// Use those same position IDs for labels, colors, and press callbacks.
+    public static let displayRows = rows
 
     /// The agent slot a key answers for, or nil for non-agent keys.
     public static func agentSlot(for key: Int) -> Int? {

@@ -13,20 +13,19 @@
 # build - forces you to re-grant permission after every rebuild. A real
 # identity gives a stable designated requirement and the grant sticks.
 #
-# Set WL_SIGN_IDENTITY to choose the identity explicitly (CI does this);
-# otherwise the first Developer ID or Apple Development identity in the
-# keychain is used.
+# Local builds reuse a private local certificate. Set WL_SIGN_IDENTITY to an
+# Apple identity for distribution, or to "-" to opt into ad-hoc signing.
 
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-APP_NAME="MicroManager"
-BUNDLE_ID="cc.worklouder.micromanager"
+APP_NAME="T3MicroManager"
+BUNDLE_ID="dev.t3micromanager.app"
 INSPECTOR_NAME="Inspector"
-INSPECTOR_BUNDLE_ID="cc.worklouder.inspector"
-VERSION="${WL_VERSION:-0.1.0}"
-OUT_DIR="build"
+INSPECTOR_BUNDLE_ID="dev.t3micromanager.inspector"
+VERSION="${WL_VERSION:-0.2.0}"
+OUT_DIR="${WL_OUT_DIR:-build}"
 APP="$OUT_DIR/$APP_NAME.app"
 INSPECTOR="$APP/Contents/Library/$INSPECTOR_NAME.app"
 
@@ -102,38 +101,49 @@ PLIST
 
 echo "==> signing"
 IDENTITY="${WL_SIGN_IDENTITY:-}"
-if [[ -z "$IDENTITY" ]]; then
-    IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
-        | grep -m1 -E '"(Apple Development|Developer ID Application)[^"]*"' \
-        | sed -E 's/.*"(.*)"/\1/' || true)"
-fi
-
-if [[ -n "$IDENTITY" ]]; then
+if [[ -z "$IDENTITY" && "${CI:-}" != "true" ]]; then
+    # No automatic fallback: a signing failure must not reset privacy grants.
+    python3 scripts/sign-local.py "$INSPECTOR" "$APP"
+elif [[ -n "$IDENTITY" && "$IDENTITY" != "-" ]]; then
     echo "    identity: $IDENTITY"
     SIGN=(codesign --force --options runtime --timestamp --sign "$IDENTITY")
+    "${SIGN[@]}" "$INSPECTOR"
+    "${SIGN[@]}" "$APP"
 else
-    echo "    WARNING: no signing identity found, falling back to ad-hoc." >&2
+    echo "    WARNING: ad-hoc signing selected (explicitly or by unsigned CI)." >&2
     echo "    The Input Monitoring grant will not survive rebuilds." >&2
     SIGN=(codesign --force --sign -)
+    "${SIGN[@]}" "$INSPECTOR"
+    "${SIGN[@]}" "$APP"
 fi
 
-# Inside out: signing a nested bundle after its host invalidates the host seal.
-"${SIGN[@]}" "$INSPECTOR"
-"${SIGN[@]}" "$APP"
-codesign --verify --deep --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
+codesign --verify --deep --strict --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
 
 if $install; then
     echo "==> installing to /Applications"
-    # Replacing a running app leaves a zombie in the menu bar.
-    pkill -f "/Applications/$APP_NAME.app" 2>/dev/null || true
-    sleep 1
-    rm -rf "/Applications/$APP_NAME.app"
-    cp -R "$APP" /Applications/
+    STAGING="$(mktemp -d /Applications/.micromanager-install.XXXXXX)"
+    trap 'rm -rf "$STAGING"' EXIT
+    ditto "$APP" "$STAGING/$APP_NAME.app"
+    codesign --verify --deep --strict "$STAGING/$APP_NAME.app"
+    # Quit only this bundle, including an older copy launched from build/.
+    swift scripts/quit-manager.swift
+    if [[ -e "/Applications/$APP_NAME.app" ]]; then
+        mv "/Applications/$APP_NAME.app" "$STAGING/previous.app"
+    fi
+    if ! mv "$STAGING/$APP_NAME.app" "/Applications/$APP_NAME.app"; then
+        if [[ -e "$STAGING/previous.app" ]]; then
+            if ! mv "$STAGING/previous.app" "/Applications/$APP_NAME.app"; then
+                trap - EXIT
+                echo "Previous app retained at $STAGING/previous.app" >&2
+            fi
+        fi
+        exit 1
+    fi
     echo "==> launching"
-    open "/Applications/$APP_NAME.app"
+    open "/Applications/$APP_NAME.app" --args --refresh-login-item
     echo
     echo "If this is the first launch, macOS will ask for Input Monitoring."
-    echo "Grant it, then toggle the manager off and on from the menu bar."
+    echo "Grant it, then quit and reopen /Applications/$APP_NAME.app."
 else
     echo
     echo "built: $APP"

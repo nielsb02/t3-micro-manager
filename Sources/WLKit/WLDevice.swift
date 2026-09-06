@@ -56,8 +56,8 @@ public final class WLDevice {
             case .noVendorCollection:
                 return "Found the device, but not its vendor collection (usage page 0xFF00). Nothing to talk to."
             case .openFailed(let r):
-                if r == kIOReturnNotPrivileged || UInt32(bitPattern: r) == 0xE00002C1 {
-                    return "Open refused (0xE00002C1). Grant Input Monitoring to the process running this app, under System Settings → Privacy & Security → Input Monitoring."
+                if r == kIOReturnNotPrivileged || r == kIOReturnNotPermitted || UInt32(bitPattern: r) == 0xE00002C1 {
+                    return String(format: "Open refused (0x%08X). Grant Input Monitoring to Micro Manager in System Settings → Privacy & Security → Input Monitoring, then quit and reopen the app.", UInt32(bitPattern: r))
                 }
                 return String(format: "IOHIDDeviceOpen failed (0x%08X)", UInt32(bitPattern: r))
             case .notConnected:

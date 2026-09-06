@@ -1,534 +1,473 @@
 import Foundation
 import SwiftUI
-import IOKit
 import IOKit.hid
 
-/// Drives the pad from Herdr agent status: each agent gets its own key, and the
-/// underglow carries a worst-state-wins aggregate.
-///
-/// Liveness comes from three places, so a missed event can never leave the pad
-/// showing something stale:
-///   1. a lifecycle stream (panes appearing, disappearing, gaining agents)
-///   2. one status stream per agent pane (instant transitions)
-///   3. a slow poll of `agent.list` as a backstop
-///
-/// `agent.list` is always the source of truth; events only decide *when* to
-/// look. This is a port of `bin/leds.js` — including the parts that were bug
-/// fixes, which are called out where they matter.
 @MainActor
 public final class BridgeController: ObservableObject {
-
-    // MARK: - Published state
-
+    @Published public private(set) var configuration: SessionConfiguration
+    @Published public private(set) var sessions: [AgentSession] = []
+    @Published public private(set) var assignments: [Int: String] = [:]
+    @Published public private(set) var availableLayers: [DeviceLayer] = []
     @Published public private(set) var isRunning = false
     @Published public private(set) var deviceConnected = false
     @Published public private(set) var keymapReady = false
     @Published public private(set) var permissionDenied = false
-    @Published public private(set) var deviceName = "—"
-    @Published public private(set) var firmware = "—"
+    @Published public private(set) var deviceName = "Creator Micro 2"
+    @Published public private(set) var firmware = ""
     @Published public private(set) var battery: String?
-    @Published public private(set) var agents: [HerdrAgent] = []
     @Published public private(set) var keyColors: [Int: Color] = [:]
     @Published public private(set) var keyEffects: [Int: OAI.Effect] = [:]
-    @Published public private(set) var aggregateState: String?
+    @Published public private(set) var aggregateState: SessionStatus?
     @Published public private(set) var lastError: String?
-    /// Another process is talking to the same pad. A shared HID open means we
-    /// receive its replies too, so a response id we never issued is a reliable
-    /// tell.
     @Published public private(set) var contendingClient = false
-    /// Whether the GitButler stack is on screen. Only the key light cares —
-    /// the panel itself lives in the app layer.
-    @Published public private(set) var stackPanelOpen = false
-    /// Same for the land window.
-    @Published public private(set) var landPanelOpen = false
-    /// Whether a Claude voice take is open, for the voice key's light.
-    @Published public private(set) var voiceActive = false
-
-    public var config: BridgeConfig
-    /// Text macros for the spare keys, reloaded on every bridge start so a
-    /// config edit only needs an off/on toggle, not a relaunch.
-    public private(set) var keyBindings = KeyBindings.load()
-
-    /// Called when the stack key is pressed. The bridge owns the key, the app
-    /// owns the window, so this is where the two meet.
-    public var onStackKey: (() -> Void)?
-    /// Called when the land key is pressed; same split as `onStackKey`.
-    public var onLandKey: (() -> Void)?
-    /// Called when either half of the wide voice key is pressed.
-    public var onVoiceKey: (() -> Void)?
-    /// Called per dial detent: +1 clockwise, -1 counter-clockwise.
-    public var onDial: ((Int) -> Void)?
-    /// Called when the joystick enters a cardinal sector.
-    public var onJoystick: ((Pad.JoystickDirection) -> Void)?
-    /// Consulted before any key does its normal job. Returning true consumes
-    /// the press — this is how a pending land confirmation turns every other
-    /// key into "cancel" without those keys also doing their usual work.
-    public var onKeyIntercept: ((Int) -> Bool)?
-
-    // MARK: - Internals
-
-    private var device = WLDevice()
-    /// Non-nil while the bridge is driving a virtual pad instead of hardware.
+    @Published public private(set) var layerActive = false
     @Published public private(set) var emulator: PadEmulator?
-    private var lifecycle: HerdrEventStream?
-    private var statusStreams: [String: HerdrEventStream] = [:]
+    @Published public private(set) var backupPath: String?
+    @Published public private(set) var isBusy = false
+
+    public var brightness: Double
+    private let providerFactory: SessionProviderFactory
+    private var provider: any SessionProvider
+    private var previewConnection: (settings: SessionConfiguration, provider: any SessionProvider)?
+    private var device = WLDevice()
+    private var deviceKeymap: [String: Any] = [:]
     private var pollTask: Task<Void, Never>?
-    private var debounceTask: Task<Void, Never>?
-    private var reopenTask: Task<Void, Never>?
-    private var lastFingerprint: String?
+    private var refreshTask: Task<Void, Never>?
+    private var stopTask: Task<Void, Never>?
+    private var generation = 0
     private var issuedIDs = Set<Int>()
-    private var warnedPermission = false
+    private var previousPicture: String?
+    private var acknowledgements = SessionAcknowledgements()
+    private var lastExternalTraffic: Date?
 
-    public init(config: BridgeConfig = BridgeConfig()) {
-        self.config = config
-        wire(device)
+    private struct MappingRecord: Codable {
+        var deviceIdentity: String
+        var backup: LayerMapping.Backup
+        var fullExportPath: String
+    }
+    private var mappingRecord: MappingRecord?
+    private var recordURL: URL {
+        SessionConfiguration.fileURL.deletingLastPathComponent()
+            .appendingPathComponent(emulator == nil ? "mapping-backup.json" : "emulator-mapping-backup.json")
+    }
+    private var deviceIdentity: String {
+        guard let info = device.info else { return "" }
+        return "\(info.serial):\(info.product)"
     }
 
-    /// Swap the hardware for a virtual pad, or back. The device is rebuilt
-    /// either way, so the bridge reconnects from scratch rather than trying to
-    /// carry state across a transport it no longer has.
-    public func useEmulator(_ on: Bool) async {
-        guard on != (emulator != nil) else { return }
-        let wasRunning = isRunning
-        if wasRunning { await stop() }
-        let pad = on ? PadEmulator() : nil
-        emulator = pad
-        device = WLDevice(emulator: pad)
-        wire(device)
-        if wasRunning { await start() }
+    public init(brightness: Double = 1,
+                providerFactory: @escaping SessionProviderFactory = { SessionProviders.make(configuration: $0) }) {
+        self.brightness = brightness
+        self.providerFactory = providerFactory
+        let loaded: SessionConfiguration
+        var loadError: String?
+        do { loaded = try SessionConfiguration.load() }
+        catch { loaded = SessionConfiguration(); loadError = "Configuration: \(error.localizedDescription)" }
+        configuration = loaded
+        provider = providerFactory(loaded)
+        lastError = loadError
+        wire()
     }
 
-    private func wire(_ device: WLDevice) {
+    private func wire() {
         device.onDisconnect = { [weak self] _ in
             guard let self else { return }
-            self.deviceConnected = false
-            self.lastFingerprint = nil
-            if self.isRunning { self.scheduleReopen() }
+            self.deviceConnected = false; self.layerActive = false; self.keymapReady = false
+            self.previousPicture = nil
         }
-        device.onTX = { [weak self] _, _, id in
-            self?.issuedIDs.insert(id)
-        }
+        device.onTX = { [weak self] _, _, id in self?.issuedIDs.insert(id) }
         device.onResponse = { [weak self] id, _, _ in
             guard let self else { return }
-            // A reply to an id we never sent came from another client.
-            if self.issuedIDs.remove(id) == nil { self.contendingClient = true }
+            if self.issuedIDs.remove(id) == nil {
+                self.lastExternalTraffic = Date()
+                self.contendingClient = true
+            }
         }
         device.onNotification = { [weak self] method, params in
-            guard let self, method == OAI.notifyHID else { return }
-            guard let dict = params as? [String: Any] else { return }
-            guard (dict["act"] as? Int) == 1 else { return }   // press, not release
-            guard let index = OAI.agIndex(dict["k"] as? String) else { return }
-            self.handleKeyPress(index)
+            guard let self, method == OAI.notifyHID,
+                  let value = params as? [String: Any], (value["act"] as? Int) == 1,
+                  let slot = OAI.agIndex(value["k"] as? String),
+                  let key = LayerMapping.physicalKey(forAgentSlot: slot) else { return }
+            Task {
+                let epoch = self.generation
+                // A layer may change between polls; never dispatch from cached state.
+                guard self.isRunning, !self.isBusy, await self.checkLayer(), self.keymapReady,
+                      self.isRunning, !self.isBusy, self.generation == epoch else { return }
+                self.handleKeyPress(key)
+            }
         }
-    }
-
-    // MARK: - Lifecycle
-
-    public func toggle() async {
-        if isRunning { await stop() } else { await start() }
     }
 
     public func start() async {
-        guard !isRunning else { return }
-        isRunning = true
-        lastError = nil
-        contendingClient = false
-        keyBindings = KeyBindings.load()
-
-        await openDevice()
-        startLifecycleStream()
+        guard !isRunning, !isBusy, stopTask == nil else { return }
+        isRunning = true; generation += 1
+        let epoch = generation
         await refresh()
-
+        guard isRunning, generation == epoch else { return }
         pollTask = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
-                let interval = self.config.pollInterval
-                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self, self.isRunning else { return }
                 await self.refresh()
             }
         }
     }
 
     public func stop() async {
-        isRunning = false
+        if let stopTask { await stopTask.value; return }
+        isRunning = false; generation += 1
         pollTask?.cancel(); pollTask = nil
-        debounceTask?.cancel(); debounceTask = nil
-        reopenTask?.cancel(); reopenTask = nil
-        lifecycle?.stop(); lifecycle = nil
-        statusStreams.values.forEach { $0.stop() }
-        statusStreams.removeAll()
-        lastFingerprint = nil
-
-        // Switching off clears the lights but deliberately leaves the keymap
-        // alone: rebinding is a flash write, and the keys light instantly on
-        // the way back in if the bindings are still there.
-        if device.isConnected {
-            await allLightsOff()
-            device.disconnect(reason: nil)
+        let pendingRefresh = refreshTask
+        pendingRefresh?.cancel()
+        let task = Task {
+            await pendingRefresh?.value
+            await clearOwnedLights()
+            previousPicture = nil
+            stopTask = nil
         }
-        deviceConnected = false
-        keyColors = [:]
-        keyEffects = [:]
-        aggregateState = nil
-        agents = []
+        stopTask = task
+        await task.value
+    }
+    public func toggle() async { if isRunning { await stop() } else { await start() } }
+
+    public func useEmulator(_ on: Bool) async {
+        guard on != (emulator != nil), !isBusy else { return }
+        isBusy = true
+        let resume = isRunning
+        await stop()
+        device.disconnect(reason: nil)
+        let pad = on ? PadEmulator() : nil
+        emulator = pad; device = WLDevice(emulator: pad)
+        deviceConnected = false; availableLayers = []; deviceKeymap = [:]
+        mappingRecord = nil; backupPath = nil; contendingClient = false
+        lastExternalTraffic = nil; issuedIDs = []
+        wire()
+        isBusy = false
+        if resume { await start() }
     }
 
-    // MARK: - Device
-
-    private func openDevice() async {
-        // Ask for Input Monitoring explicitly. hidapi-style opens just fail
-        // with a privilege violation without ever raising the prompt, which
-        // reads as a bug rather than a permission.
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+    private func connect() async throws {
+        if device.isConnected { return }
+        if emulator == nil && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
             _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
         }
+        do { try device.connect() }
+        catch { permissionDenied = emulator == nil && IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted; throw error }
+        deviceConnected = true; permissionDenied = false
+        deviceName = device.info?.product ?? "Creator Micro 2"
+        if let version = try await device.callAsync("sys.version") as? [String: Any] {
+            firmware = version["version"] as? String ?? ""
+        }
+        try await readMapping()
+    }
 
-        do {
-            try device.connect()
-            deviceConnected = true
-            permissionDenied = false
-            warnedPermission = false
-            deviceName = device.info?.product ?? "Work Louder device"
-            lastError = nil
-        } catch {
-            deviceConnected = false
-            let message = error.localizedDescription
-            if message.contains("0xE00002C1") || message.contains("Input Monitoring") {
-                permissionDenied = true
-                if !warnedPermission { warnedPermission = true; lastError = message }
-            } else {
-                lastError = message
+    private func readMapping() async throws {
+        deviceKeymap = try await KeymapManager.read(device)
+        availableLayers = try LayerMapping.layers(in: deviceKeymap)
+        if let data = try? Data(contentsOf: recordURL),
+           let record = try? JSONDecoder().decode(MappingRecord.self, from: data),
+           record.deviceIdentity == deviceIdentity {
+            mappingRecord = record; backupPath = record.fullExportPath
+        } else { mappingRecord = nil; backupPath = nil }
+        updateMappingReadiness()
+    }
+
+    private func updateMappingReadiness() {
+        guard let target = configuration.target else { keymapReady = false; return }
+        keymapReady = mappingRecord?.backup.target == target
+            && configuration.sessionKeys.allSatisfy {
+                mappingRecord?.backup.originals[$0] != nil
+                    && mappingRecord?.backup.ownedCode(for: $0) == LayerMapping.agentCode(forPhysicalKey: $0)
             }
-            scheduleReopen()
+            && LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys)
+    }
+
+    public func inspectDevice() async {
+        guard !isBusy else { return }
+        isBusy = true; defer { isBusy = false }
+        do { try await connect(); try await readMapping(); _ = await checkLayer(); lastError = nil }
+        catch { lastError = error.localizedDescription }
+    }
+
+    @discardableResult private func checkLayer() async -> Bool {
+        guard device.isConnected, let target = configuration.target else { layerActive = false; return false }
+        do {
+            guard let status = try await device.callAsync("device.status") as? [String: Any] else {
+                layerActive = false; return false
+            }
+            if let value = status["battery"] as? Int { battery = "\(value)%" }
+            let active = LayerMapping.isActive(status: status, config: deviceKeymap, target: target)
+            if active != layerActive { previousPicture = nil }
+            layerActive = active
+            return active
+        } catch { layerActive = false; previousPicture = nil; return false }
+    }
+
+    public func saveConfiguration(_ next: SessionConfiguration) async {
+        guard !isBusy else { return }
+        do { try next.validate() } catch { lastError = error.localizedDescription; return }
+        isBusy = true
+        let resume = isRunning
+        await stop()
+        do {
+            try next.save()
+            if !configuration.hasSameConnection(as: next) {
+                provider = providerFactory(next)
+                acknowledgements = SessionAcknowledgements()
+            }
+            configuration = next
+            assignments = [:]; sessions = []; keyColors = [:]; keyEffects = [:]
+            aggregateState = nil; lastError = nil; updateMappingReadiness()
+        } catch {
+            isBusy = false
+            if resume { await start() }
+            lastError = error.localizedDescription
             return
         }
-
-        if let version = try? await device.callAsync("sys.version"),
-           let dict = version as? [String: Any],
-           let text = dict["version"] as? String {
-            firmware = text
-        }
-        if let status = try? await device.callAsync("device.status"),
-           let dict = status as? [String: Any],
-           let percent = dict["battery"] as? Int {
-            let charging = (dict["is_charging"] as? Bool) == true
-            battery = "\(percent)%\(charging ? " ⚡" : "")"
-        }
-
-        await ensureKeymap()
+        isBusy = false
+        if resume { await start() }
     }
 
-    /// Per-key lighting only works on keys bound to `KV_OAI_AG*` on the active
-    /// layer, and nothing reports a mismatch — `v.oai.thstatus` answers
-    /// `{"ok":1}` for a key it cannot light. So check rather than assume.
-    private func ensureKeymap() async {
+    public func applyMapping() async {
+        guard !isBusy else { return }
+        isBusy = true
+        let resume = isRunning
+        await stop()
         do {
-            if config.manageKeymap {
-                _ = try await KeymapManager.apply(device)
-                keymapReady = true
-            } else {
-                let cfg = try await KeymapManager.read(device)
-                keymapReady = KeymapManager.isAgentKeymapApplied(cfg)
-                if !keymapReady {
-                    lastError = "The agent keys and the stack key are not bound to KV_OAI_AG00..AG06, so per-key colours will do nothing."
+            try configuration.validate()
+            guard let target = configuration.target else { throw ConfigurationError.invalid("Choose a layer first.") }
+            try await connect(); try await readMapping()
+            var base = deviceKeymap
+            // Restore our prior selected bindings before moving or resizing the mapping.
+            if let record = mappingRecord {
+                guard record.backup.target == target else {
+                    throw ConfigurationError.invalid("Restore the current mapping before applying to another layer. Your original bindings will be kept.")
+                }
+                base = try LayerMapping.restoring(config: base, backup: record.backup)
+            }
+            var backup = try LayerMapping.capture(config: base, target: target, keys: configuration.sessionKeys)
+            if let previous = mappingRecord {
+                for (key, original) in previous.backup.originals where backup.originals[key] == nil {
+                    backup.originals[key] = original
+                    backup.ownedCodes?[key] = previous.backup.ownedCode(for: key)
                 }
             }
-        } catch {
-            keymapReady = false
-            lastError = "Keymap: \(error.localizedDescription)"
-        }
-    }
-
-    private func scheduleReopen() {
-        guard isRunning, reopenTask == nil else { return }
-        reopenTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self, self.isRunning else { return }
-                if self.deviceConnected { break }
-                await self.openDevice()
-                if self.deviceConnected {
-                    await self.forceRepaint()
-                    break
-                }
+            let next = try LayerMapping.applying(config: base, target: target, keys: configuration.sessionKeys)
+            let directory = SessionConfiguration.fileURL.deletingLastPathComponent().appendingPathComponent("backups")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let export = directory.appendingPathComponent("keymap-\(UUID().uuidString).json")
+            try JSONSerialization.data(withJSONObject: deviceKeymap, options: [.prettyPrinted, .sortedKeys]).write(to: export, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: export.path)
+            let record = MappingRecord(deviceIdentity: deviceIdentity, backup: backup, fullExportPath: export.path)
+            // Persist recovery information before the flash write.
+            try JSONEncoder().encode(record).write(to: recordURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recordURL.path)
+            mappingRecord = record; backupPath = export.path
+            try await writeMapping(next)
+            guard LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys) else {
+                throw ConfigurationError.invalid("The device did not retain the selected bindings. The backup is available for restoration.")
             }
-            self?.reopenTask = nil
-        }
+            lastError = nil
+        } catch { lastError = error.localizedDescription }
+        isBusy = false
+        if resume && lastError == nil { await start() }
     }
 
-    // MARK: - Herdr events
-
-    private func startLifecycleStream() {
-        guard isRunning else { return }
-        let stream = HerdrEventStream(subscriptions: [
-            ["type": "pane.created"],
-            ["type": "pane.closed"],
-            ["type": "pane.exited"],
-            ["type": "pane.agent_detected"],
-        ])
-        stream.onEvent = { [weak self] _ in self?.schedule() }
-        stream.onClosed = { [weak self] _ in
-            guard let self, self.isRunning else { return }
-            self.lifecycle = nil
-            Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                self?.startLifecycleStream()
+    public func restoreMapping() async {
+        guard !isBusy else { return }
+        isBusy = true; defer { isBusy = false }
+        await stop()
+        do {
+            try await connect(); try await readMapping()
+            guard let record = mappingRecord else { throw ConfigurationError.invalid("No mapping backup for this device.") }
+            let restored = try LayerMapping.restoring(config: deviceKeymap, backup: record.backup)
+            try await writeMapping(restored)
+            guard NSDictionary(dictionary: restored).isEqual(to: deviceKeymap) else {
+                throw ConfigurationError.invalid("Restore verification failed. Keep the saved backup.")
             }
-        }
-        lifecycle = stream.start()
+            try FileManager.default.removeItem(at: recordURL)
+            mappingRecord = nil; backupPath = nil; updateMappingReadiness(); lastError = nil
+        } catch { lastError = error.localizedDescription }
     }
 
-    /// One dedicated stream per agent pane: a subscription owns its connection
-    /// and cannot be extended after the fact.
-    private func reconcileStatusStreams(_ agents: [HerdrAgent]) {
-        let wanted = Set(agents.compactMap(\.paneID))
-        for (paneID, stream) in statusStreams where !wanted.contains(paneID) {
-            stream.stop()
-            statusStreams.removeValue(forKey: paneID)
+    private func writeMapping(_ value: [String: Any]) async throws {
+        let current = try await KeymapManager.read(device)
+        guard NSDictionary(dictionary: current).isEqual(to: deviceKeymap) else {
+            deviceKeymap = current; updateMappingReadiness()
+            throw ConfigurationError.invalid("The mapping changed in Input during setup. Read the layers again and retry.")
         }
-        for paneID in wanted where statusStreams[paneID] == nil {
-            let stream = HerdrEventStream(subscriptions: [
-                ["type": "pane.agent_status_changed", "pane_id": paneID],
-            ])
-            stream.onEvent = { [weak self] _ in self?.schedule() }
-            stream.onClosed = { [weak self] _ in
-                self?.statusStreams.removeValue(forKey: paneID)
-            }
-            statusStreams[paneID] = stream.start()
+        if !NSDictionary(dictionary: value).isEqual(to: deviceKeymap) {
+            let data = try JSONSerialization.data(withJSONObject: value)
+            _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": String(decoding: data, as: UTF8.self)])
         }
+        deviceKeymap = try await KeymapManager.read(device)
+        availableLayers = try LayerMapping.layers(in: deviceKeymap)
+        updateMappingReadiness(); previousPicture = nil
     }
 
-    private func schedule() {
-        guard debounceTask == nil else { return }
-        debounceTask = Task { [weak self] in
-            guard let self else { return }
-            let delay = self.config.debounce
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            self.debounceTask = nil
-            await self.refresh()
+    public func testConnection(_ settings: SessionConfiguration) async throws -> [AgentSession] {
+        try await previewProvider(for: settings).validatedSessions()
+    }
+
+    private func previewProvider(for settings: SessionConfiguration) -> any SessionProvider {
+        if let previewConnection, previewConnection.settings.hasSameConnection(as: settings) {
+            return previewConnection.provider
         }
+        let preview = providerFactory(settings)
+        previewConnection = (settings, preview)
+        return preview
     }
 
-    // MARK: - Repaint
-
-    public func forceRepaint() async {
-        lastFingerprint = nil
-        await refresh()
-    }
+    public func forceRepaint() async { previousPicture = nil; await refresh() }
 
     private func refresh() async {
-        guard isRunning else { return }
+        guard isRunning, !isBusy else { return }
+        if let refreshTask { await refreshTask.value; return }
+        let task = Task {
+            defer { refreshTask = nil }
+            await performRefresh()
+        }
+        refreshTask = task
+        await task.value
+    }
 
-        let fetched: [HerdrAgent]
+    private func performRefresh() async {
+        let epoch = generation
+        let activeProvider = provider
+        var failure: String?
+        contendingClient = lastExternalTraffic.map { Date().timeIntervalSince($0) < 30 } ?? false
         do {
-            fetched = try await HerdrClient.listAgents()
+            let fetched = try await activeProvider.validatedSessions()
+            guard isRunning, generation == epoch else { return }
+            sessions = activeProvider.acknowledgementMode == .local
+                ? acknowledgements.applying(to: fetched) : fetched
+            assignments = SessionAssignments.assign(sessions, configuration: configuration, previous: assignments)
         } catch {
-            lastError = error.localizedDescription
-            return
+            guard isRunning, generation == epoch else { return }
+            failure = error.localizedDescription
+            sessions = sessions.map { var stale = $0; stale.status = .unknown; return stale }
         }
-        lastError = nil
-        agents = fetched
-        reconcileStatusStreams(fetched)
-
-        let state = StatusMapper.aggregate(fetched, config)
-        // Macro and voice keys share ids, so the binding decides each key's
-        // light: configured text wins, the wide key falls back to voice.
-        let flexKeys = (Pad.macroKeyIDs + Pad.voiceKeyIDs).map { key -> OAI.Thread in
-            if keyBindings.text(for: key) != nil {
-                return StatusMapper.macroThread(id: key, config)
-            }
-            if Pad.voiceKeyIDs.contains(key) {
-                return StatusMapper.voiceThread(id: key, active: voiceActive, config)
-            }
-            return OAI.Thread(id: key, brightness: 0, effect: .off)
-        }
-        let threads = StatusMapper.threads(for: fetched, config)
-            + [StatusMapper.stackThread(open: stackPanelOpen, config),
-               StatusMapper.tabCycleThread(config),
-               StatusMapper.landThread(open: landPanelOpen, config)]
-            + flexKeys
-
-        // Fingerprint the whole rendered picture, not just the aggregate, so
-        // one agent changing still repaints when the worst state has not.
-        let fingerprint = threads.map { thread in
-            "\(thread.id):\(thread.color ?? -1):\(thread.effect?.rawValue ?? -1):\(thread.brightness ?? -1)"
-        }.joined(separator: "|") + "|agg:\(state ?? "-")"
-
-        publishKeyState(threads)
-        aggregateState = state
-
-        guard fingerprint != lastFingerprint else { return }
-        lastFingerprint = fingerprint
-        await apply(state: state, threads: threads)
-    }
-
-    private func publishKeyState(_ threads: [OAI.Thread]) {
-        var colors: [Int: Color] = [:]
-        var effects: [Int: OAI.Effect] = [:]
-        for thread in threads {
-            guard let packed = thread.color, (thread.brightness ?? 0) > 0,
-                  let effect = thread.effect, effect != .off else { continue }
-            colors[thread.id] = Color(packedRGB: packed)
-            effects[thread.id] = effect
-        }
-        keyColors = colors
-        keyEffects = effects
-    }
-
-    private func apply(state: String?, threads: [OAI.Thread]) async {
-        guard deviceConnected else { return }
+        renderPreview()
         do {
-            _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
-            let zone = StatusMapper.zone(for: state, config) ?? .dark
-            _ = try await device.callAsync(
-                OAI.methodRGBConfig,
-                params: OAI.rgbConfigParams(
-                    keys: config.driveBacklight ? zone : .dark,
-                    ambient: zone
-                )
-            )
-        } catch {
-            lastError = error.localizedDescription
-            lastFingerprint = nil   // repaint on the next tick
-        }
+            if activeProvider.requiresEmulator && emulator == nil {
+                throw ConfigurationError.invalid("Demo sessions use the emulator. Choose Try demo to start.")
+            }
+            try await connect()
+            guard isRunning, generation == epoch else { return }
+            // Verify selected bindings periodically too, so Input edits are respected.
+            try await readMapping()
+            guard await checkLayer(), keymapReady else { lastError = failure; return }
+            guard isRunning, generation == epoch else { return }
+            try await paint()
+        } catch { failure = [failure, error.localizedDescription].compactMap { $0 }.joined(separator: " · ") }
+        lastError = failure
     }
 
-    /// Thread state paints over zone state, so clearing the zones alone leaves
-    /// the pad lit. Both have to go.
-    private func allLightsOff() async {
-        let threads = (0...Pad.maxThreadID).map {
-            OAI.Thread(id: $0, brightness: 0, effect: .off, syncKeys: false, syncAmbient: false)
+    private func light(_ session: AgentSession?, key: Int) -> OAI.Thread {
+        guard let session else { return OAI.Thread(id: key, brightness: 0, effect: .off) }
+        let appearance = SessionAppearance(status: session.status)
+        return OAI.Thread(id: key, color: appearance.color, brightness: brightness,
+                          effect: appearance.effect, speed: appearance.speed)
+    }
+    private var picture: [OAI.Thread] {
+        configuration.sessionKeys.map { key in light(sessions.first(where: { $0.id == assignments[key] }), key: key) }
+    }
+    private func renderPreview() {
+        keyColors = [:]; keyEffects = [:]
+        for thread in picture {
+            guard let color = thread.color, thread.effect != .off else { continue }
+            keyColors[thread.id] = Color(packedRGB: color); keyEffects[thread.id] = thread.effect
         }
+        aggregateState = SessionStatus.aggregate(sessions)
+    }
+    private func paint() async throws {
+        let threads = picture.map { physical -> OAI.Thread in
+            var wire = physical
+            wire.id = LayerMapping.agentSlot(forPhysicalKey: physical.id)!
+            return wire
+        }
+        let fingerprint = threads.map { "\($0.id):\($0.color ?? 0):\($0.effect?.rawValue ?? 0):\($0.speed ?? 0):\($0.brightness ?? 0)" }.joined(separator: "|") + (aggregateState?.rawValue ?? "")
+        guard fingerprint != previousPicture else { return }
+        _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
+        if configuration.driveAmbient {
+            let aggregate = aggregateState.map { AgentSession(id: "", title: "", status: $0) }
+            let thread = light(aggregate, key: 0)
+            _ = try await device.callAsync(OAI.methodRGBConfig, params: ["ambient": OAI.Zone(effect: thread.effect ?? .off, brightness: thread.brightness ?? 0, speed: thread.speed ?? 0.5, magic: 1, color: thread.color ?? 0).wire])
+        }
+        previousPicture = fingerprint
+    }
+    private func clearOwnedLights() async {
+        guard device.isConnected, await checkLayer(), keymapReady else { return }
+        let threads = configuration.sessionKeys.compactMap { LayerMapping.agentSlot(forPhysicalKey: $0) }
+            .map { OAI.Thread(id: $0, brightness: 0, effect: .off) }
         _ = try? await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
-        _ = try? await device.callAsync(
-            OAI.methodRGBConfig,
-            params: OAI.rgbConfigParams(keys: .dark, ambient: .dark)
-        )
+        if configuration.driveAmbient {
+            _ = try? await device.callAsync(OAI.methodRGBConfig, params: ["ambient": OAI.Zone.dark.wire])
+        }
     }
 
-    // MARK: - Key presses
-
-    /// Every bound key arrives here. Which key does what is the one place that
-    /// has to agree with `Pad`, so keep the dispatch in a single switch.
-    public func handleKeyPress(_ index: Int) {
-        if onKeyIntercept?(index) == true { return }
-        if index == Pad.stackKeyID {
-            onStackKey?()
-        } else if index == Pad.tabCycleKeyID {
-            Task { await cycleTabs() }
-        } else if index == Pad.landKeyID {
-            onLandKey?()
-        } else if Pad.macroKeyIDs.contains(index) || Pad.voiceKeyIDs.contains(index) {
-            // A configured text macro wins over the key's built-in role, which
-            // is how the config file may repurpose the wide voice key.
-            if let text = keyBindings.text(for: index) {
-                Task { await injectPrompt(text) }
-            } else if Pad.voiceKeyIDs.contains(index) {
-                onVoiceKey?()
+    public func handleKeyPress(_ key: Int) {
+        guard isRunning, !isBusy, let id = assignments[key], let session = sessions.first(where: { $0.id == id }) else { return }
+        Task { await focusSession(session) }
+    }
+    public func focusSession(_ session: AgentSession) async {
+        let epoch = generation
+        do {
+            guard sessions.contains(where: { $0.id == session.id && $0.environmentID == session.environmentID }) else {
+                throw SessionProviderError.unavailableSession
             }
-        } else if index == Pad.dialUpID || index == Pad.dialDownID {
-            onDial?(index == Pad.dialUpID ? 1 : -1)
-        } else if let direction = Pad.JoystickDirection(keyID: index) {
-            onJoystick?(direction)
-        } else if let slot = Pad.agentSlot(for: index) {
-            Task { await focusSlot(slot) }
-        }
-    }
-
-    /// Types a macro string into the focused agent's prompt, unsubmitted —
-    /// the human still reads it and presses enter.
-    public func injectPrompt(_ text: String) async {
-        do {
-            guard let agent = try await HerdrClient.focusedAgent(),
-                  let pane = agent.paneID
-            else {
-                lastError = "Nothing has focus in Herdr right now."
-                return
-            }
-            try await HerdrClient.sendText(paneID: pane, text: text)
+            try await performOpen(session, with: provider, acknowledgesCurrent: true)
         } catch {
-            lastError = error.localizedDescription
+            if generation == epoch { lastError = error.localizedDescription }
         }
     }
 
-    /// Repaints the voice key. Same contract as `setStackPanelOpen`.
-    public func setVoiceActive(_ active: Bool) async {
-        guard voiceActive != active else { return }
-        voiceActive = active
+    public func openSession(_ session: AgentSession, using settings: SessionConfiguration) async throws {
+        try await performOpen(session, with: previewProvider(for: settings),
+                              acknowledgesCurrent: configuration.hasSameConnection(as: settings))
+    }
+
+    private func performOpen(_ session: AgentSession, with destination: any SessionProvider,
+                             acknowledgesCurrent: Bool) async throws {
+        guard !isBusy else { throw SessionProviderError.unavailableSession }
+        let epoch = generation
+        try await destination.openSession(session)
+        guard acknowledgesCurrent, generation == epoch else { return }
+        if destination.acknowledgementMode == .local { acknowledgements.acknowledge(session) }
+        lastError = nil
         await forceRepaint()
     }
 
-    /// Lets app-layer features that fail outside the bridge surface their
-    /// error where the menu already shows the bridge's own.
-    public func noteError(_ message: String) {
-        lastError = message
+    public var inputCapabilities: SessionInputCapabilities {
+        (provider as? any SessionInputProvider)?.inputCapabilities ?? SessionInputCapabilities()
     }
 
-    /// Advances the focused workspace to its next tab, wrapping.
-    public func cycleTabs() async {
-        do {
-            try await HerdrClient.cycleTabs()
-        } catch {
-            lastError = error.localizedDescription
+    public func sendInput(_ input: SessionInput, to sessionID: String) async throws {
+        guard isRunning, !isBusy, let session = sessions.first(where: { $0.id == sessionID }) else {
+            throw SessionProviderError.unavailableSession
         }
+        guard let destination = provider as? any SessionInputProvider,
+              destination.inputCapabilities.supports(input) else { throw SessionProviderError.unsupportedInput }
+        try await destination.sendInput(input, to: session)
     }
 
-    /// Repaints the stack key. Called by the app when the window opens or
-    /// closes, so the key reflects what is actually on screen.
-    public func setStackPanelOpen(_ open: Bool) async {
-        guard stackPanelOpen != open else { return }
-        stackPanelOpen = open
-        await forceRepaint()
-    }
-
-    /// Repaints the land key. Same contract as `setStackPanelOpen`.
-    public func setLandPanelOpen(_ open: Bool) async {
-        guard landPanelOpen != open else { return }
-        landPanelOpen = open
-        await forceRepaint()
-    }
-
-    /// Slot N is the Nth key in reading order (`Pad.agentKeyIDs[N]`) — the
-    /// same mapping the lighting uses, which is what makes the key you look at
-    /// the key you press.
-    ///
-    /// Herdr selects the pane but leaves the terminal wherever it was in the
-    /// window order, so an agent key pressed from a browser used to move a
-    /// cursor you could not see. The terminal comes forward with it.
-    public func focusSlot(_ index: Int) async {
-        guard index >= 0, index < agents.count else { return }
-        guard let target = agents[index].focusTarget else { return }
-        do {
-            try await HerdrClient.focusAgent(target)
-            raiseTerminal()
-        } catch {
-            lastError = error.localizedDescription
-        }
-    }
-
-    /// The app Herdr's panes live in. Override with `WL_TERMINAL_BUNDLE_ID` if
-    /// they live somewhere other than Ghostty.
-    public static let defaultTerminalBundleID = "com.mitchellh.ghostty"
-
-    /// Brings the terminal forward unless it is already the active app.
-    ///
-    /// Nothing is ever launched: the agent whose key was pressed is running in
-    /// a pane of a terminal that is by definition already up, so a terminal
-    /// that is not running means the bundle id is wrong, and opening a fresh
-    /// window would not be what the key meant. macOS may refuse a background
-    /// app's `activate` outright, which is what the second attempt is for —
-    /// `openApplication` on an already-running app raises it the way `open -a`
-    /// does.
-    private func raiseTerminal() {
-        let identifier = ProcessInfo.processInfo.environment["WL_TERMINAL_BUNDLE_ID"]
-            .flatMap { $0.isEmpty ? nil : $0 } ?? Self.defaultTerminalBundleID
-        guard let app = NSRunningApplication
-            .runningApplications(withBundleIdentifier: identifier).first
-        else { return }
-        guard !app.isActive else { return }
-        if app.activate(options: []) { return }
-        guard let url = app.bundleURL else { return }
-        NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+    public func noteError(_ message: String) { lastError = message }
+    public func startDemo() async {
+        guard !isBusy else { return }
+        await useEmulator(true)
+        guard emulator != nil else { return }
+        await inspectDevice()
+        guard lastError == nil else { return }
+        var next = configuration
+        next.provider = .demo; next.target = availableLayers.first?.target
+        next.selection = .recent; next.pinnedSessions = [:]
+        next.sessionKeys = Pad.agentKeyIDs
+        // Demo is intentionally temporary; retain the user's saved real setup.
+        await stop()
+        provider = providerFactory(next)
+        acknowledgements = SessionAcknowledgements()
+        configuration = next
+        await applyMapping()
+        if lastError == nil { await start() }
     }
 }

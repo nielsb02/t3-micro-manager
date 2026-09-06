@@ -15,6 +15,21 @@ uses.
 > almost any payload, including malformed ones. A wrong shape looks exactly like
 > a right one. The only ground truth is the LEDs. Budget for that.
 
+## Slot numbering correction for this fork
+
+Firmware AG slot IDs are separate from physical switch positions. Slot N lights
+whichever switch is bound to `KV_OAI_AGNN`; a press emits that same AG number.
+The examples below often choose matching switch/slot numbers for convenience.
+That equality is not a firmware requirement.
+
+This fork reserves AG00–AG05 for Codex and uses AG06–AG18 for its configurable
+session keys. The installed Codex handler recognizes only AG00–AG05. Reusing those
+slots on a different layer makes Codex receive the same button events. Both LED
+updates and presses must use the selected keycode's slot number.
+
+See the [independent firmware verification](https://github.com/okko/micro2-agent-keys/blob/51c45439abeb91f9c6b4a278379dc707c51c0057/docs/findings.md#L64-L68)
+and [collision investigation](codex-slot-collision.md).
+
 ---
 
 ## Contents
@@ -366,8 +381,8 @@ const after = JSON.parse((await dev.call("fs.read", { file: "keymap.json" })).da
 console.log(after.profiles[0].layers[0].layout.keymap);
 ```
 
-Key *N* takes keycode `KV_OAI_AG` + zero-padded *N* — key 3 is `KV_OAI_AG03`.
-The mapping is positional, so write per key rather than per row unless you mean
+These examples assign switch *N* to slot *N*, using `KV_OAI_AG` plus zero-padded *N*. Other slot assignments work too.
+The keymap addresses physical positions, so write per key rather than per row unless you mean
 to take a whole row's keycodes with it.
 
 > This is a **flash write**. Do it once at startup when something has actually
@@ -375,13 +390,15 @@ to take a whole row's keycodes with it.
 
 ### Geometry
 
-The matrix is `[2, 4, 4, 3]` and the key index runs row-major from 0. One
-surprise: **the top row is wired right to left**, so index 0 is the top-**right**
-key.
+The matrix is `[2, 4, 4, 3]` and the key index runs row-major from 0, left to
+right. On Creator Micro 2, index 0 is the top-left key and index 1 is top-right.
+This corrects the earlier reversed-row claim; the installed Work Louder Input
+0.18.4 layout and conversion code confirm the matrix order. See
+[top-row mapping evidence](top-row-mapping.md).
 
 ```
  ┌─────────────┬─────────────┐
- │      1      │      0      │   row 0   <- reversed: 0 is on the RIGHT
+ │      0      │      1      │   row 0
  ├──────┬──────┼──────┬──────┤
  │   2  │   3  │   4  │   5  │   row 1
  ├──────┼──────┼──────┼──────┤
@@ -399,7 +416,7 @@ you want the whole cap to glow evenly.
 
 ## 8. Per-key colour
 
-This is the payoff. The method is `v.oai.thstatus`, and each key is a "thread".
+This is the payoff. The method is `v.oai.thstatus`, and each AG slot is a "thread". The active keymap determines which physical switch displays it.
 
 **Params are a bare ARRAY**, not an object — one entry per key you want to
 change:
@@ -426,7 +443,7 @@ unchanged on the device**:
 
 | field | meaning |
 |---|---|
-| `id`  | key index, 0-based, row-major (required) |
+| `id`  | firmware AG slot, 0–19 (required) |
 | `c`   | packed `0xRRGGBB` integer |
 | `b`   | brightness, `0..1` |
 | `e`   | effect **as a number** (see table below) |
@@ -478,8 +495,8 @@ An AG-bound key sends no keystroke, but it reports itself as a **notification**:
 {"m": "v.oai.hid", "p": {"k": "AG01", "act": 1}}
 ```
 
-- `k` — the key name, `AG00`..`AG19`. The number is the key index, the same one
-  you use as a thread id.
+- `k` — the key name, `AG00`..`AG19`. The number is the firmware AG slot, the same one
+  you use as a thread id. It need not match the physical switch index.
 - `act` — `1` on press, `0` on release.
 - `ag` — an agent field belonging to the Codex firmware's own agent-key
   feature. `OAI.agIndex` in `Sources/WLKit/OAIProtocol.swift` ignores it, and

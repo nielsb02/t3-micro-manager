@@ -13,9 +13,14 @@ final class EmulatorWindowController: NSObject, NSWindowDelegate {
     static let shared = EmulatorWindowController()
 
     private var window: NSWindow?
+    private weak var shownEmulator: PadEmulator?
 
     func show(_ emulator: PadEmulator) {
         if let window {
+            if shownEmulator !== emulator {
+                window.contentView = NSHostingView(rootView: EmulatorView(emulator: emulator))
+                shownEmulator = emulator
+            }
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -35,6 +40,7 @@ final class EmulatorWindowController: NSObject, NSWindowDelegate {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         self.window = window
+        shownEmulator = emulator
     }
 
     func close() {
@@ -47,6 +53,7 @@ final class EmulatorWindowController: NSObject, NSWindowDelegate {
 
 struct EmulatorView: View {
     @ObservedObject var emulator: PadEmulator
+    @State private var layerError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -113,14 +120,15 @@ struct EmulatorView: View {
     }
 
     private func keyButton(_ key: Int, width: CGFloat = EmulatorView.keyW) -> some View {
-        let state = emulator.keys[key]
-        let lit = state?.isLit == true && emulator.bound.contains(key)
+        let state = emulator.light(forPhysicalKey: key)
+        let isBound = emulator.slot(forPhysicalKey: key) != nil
+        let lit = state?.isLit == true
         return Button {
             emulator.press(key)
         } label: {
             RoundedRectangle(cornerRadius: 6)
                 .fill(lit ? Color(packedRGB: state?.color ?? 0)
-                          : Color.white.opacity(emulator.bound.contains(key) ? 0.10 : 0.04))
+                          : Color.white.opacity(isBound ? 0.10 : 0.04))
                 .frame(width: width, height: Self.keyH)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
@@ -139,11 +147,12 @@ struct EmulatorView: View {
     }
 
     private func helpText(_ key: Int) -> String {
-        guard emulator.bound.contains(key) else {
+        guard let slot = emulator.slot(forPhysicalKey: key) else {
             return "Key \(key) — not bound to KV_OAI_AG*, so it sends a keystroke and cannot light"
         }
-        guard let state = emulator.keys[key], state.isLit else { return "Key \(key) — dark" }
-        return "Key \(key) — \(hexString(state.color)), \(state.effect.label.lowercased())"
+        let binding = "Key \(key) → AG\(String(format: "%02d", slot))"
+        guard let state = emulator.light(forPhysicalKey: key), state.isLit else { return "\(binding) — dark" }
+        return "\(binding) — \(hexString(state.color)), \(state.effect.label.lowercased())"
     }
 
     private var joystick: some View {
@@ -187,18 +196,34 @@ struct EmulatorView: View {
     // MARK: - Below the pad
 
     private var controls: some View {
-        HStack {
-            Label(
-                emulator.bound.isEmpty
-                    ? "Stock keymap — no key can light yet"
-                    : "\(emulator.bound.count) keys bound to KV_OAI_AG*",
-                systemImage: emulator.bound.isEmpty ? "exclamationmark.triangle" : "checkmark.circle"
-            )
-            .font(.caption)
-            .foregroundStyle(emulator.bound.isEmpty ? .orange : .secondary)
-            Spacer()
-            Button("Reset") { emulator.reset() }
-                .help("Back to a factory pad: stock keymap, every light off")
+        VStack(alignment: .leading, spacing: 10) {
+            Picker("Active layer", selection: Binding(
+                get: { emulator.activeLayer },
+                set: { target in
+                    do { try emulator.activate(target); layerError = nil }
+                    catch { layerError = error.localizedDescription }
+                }
+            )) {
+                ForEach(emulator.layers) { layer in
+                    Text(layer.title).tag(layer.target)
+                }
+            }
+            HStack {
+                Label(
+                    emulator.bound.isEmpty
+                        ? "No session keys on this layer"
+                        : "\(emulator.bound.count) session keys on this layer",
+                    systemImage: emulator.bound.isEmpty ? "keyboard" : "checkmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset") { emulator.reset() }
+                    .help("Restore the virtual pad's original layout and clear its lights")
+            }
+            if let layerError {
+                Text(layerError).font(.caption).foregroundStyle(.red)
+            }
         }
     }
 

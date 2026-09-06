@@ -1,6 +1,6 @@
-import SwiftUI
 import AppKit
 import ServiceManagement
+import SwiftUI
 import WLKit
 
 struct MenuPanelView: View {
@@ -12,235 +12,171 @@ struct MenuPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-
             if bridge.permissionDenied {
                 permissionBanner
-            } else if bridge.isRunning {
-                padSection
-                Divider()
-                agentSection
             } else {
-                idleHint
+                padSection
+                if bridge.isRunning {
+                    Divider()
+                    sessionSection
+                }
             }
-
             if let error = bridge.lastError, !bridge.permissionDenied {
-                Divider()
-                Text(error)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 14).padding(.vertical, 8)
+                message(error, color: .red)
             }
-
             if bridge.contendingClient {
-                Divider()
-                Label(
-                    "Another app is also driving this pad — colours may fight.",
-                    systemImage: "exclamationmark.triangle"
-                )
-                .font(.caption)
-                .foregroundStyle(.orange)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.horizontal, 14).padding(.vertical, 8)
+                message("Another app is communicating with this pad. If lights flicker, pause its lighting integration.", color: .orange)
             }
-
             Divider()
             footer
         }
-        .frame(width: 300)
+        .frame(width: 340)
     }
 
-    // MARK: - Header
-
     private var header: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 2) {
+        HStack {
+            VStack(alignment: .leading, spacing: 3) {
                 Text("Micro Manager").font(.headline)
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                Text(bridge.configuration.provider.title + " · " + subtitle)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
-            Toggle("", isOn: Binding(
+            Toggle("Enable Micro Manager", isOn: Binding(
                 get: { bridge.isRunning },
                 set: { on in
                     BridgeSettings.enabled = on
                     Task { await bridge.toggle() }
                 }
             ))
-            .toggleStyle(.switch)
-            .labelsHidden()
+            .toggleStyle(.switch).labelsHidden()
             .help(bridge.isRunning ? "Turn off" : "Turn on")
         }
-        .padding(.horizontal, 14).padding(.vertical, 10)
+        .padding(14)
+        .disabled(bridge.isBusy)
     }
 
     private var subtitle: String {
         guard bridge.isRunning else { return "Off" }
-        guard bridge.deviceConnected else { return "Looking for the pad…" }
-        var parts = [bridge.deviceName, bridge.firmware]
-        if let battery = bridge.battery { parts.append(battery) }
-        return parts.joined(separator: " · ")
+        guard bridge.deviceConnected else { return "Looking for your Micro…" }
+        guard bridge.configuration.target != nil else { return "Choose a layer" }
+        guard bridge.keymapReady else { return "Configure session keys" }
+        return bridge.layerActive ? "Connected" : "Waiting for your layer"
     }
-
-    // MARK: - Pad
 
     private var padSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(Pad.displayRows.enumerated()), id: \.offset) { _, row in
-                HStack(spacing: 6) {
-                    ForEach(row, id: \.self) { key in keyView(key) }
-                    Spacer(minLength: 0)
-                }
-            }
-        }
-        .padding(.horizontal, 14).padding(.vertical, 12)
-    }
-
-    private func keyView(_ index: Int) -> some View {
-        let color = bridge.keyColors[index]
-        let isBound = Pad.boundKeyIDs.contains(index)
-        let isStackKey = index == Pad.stackKeyID
-        let isTabCycleKey = index == Pad.tabCycleKeyID
-        let isLandKey = index == Pad.landKeyID
-        let macroText = bridge.keyBindings.text(for: index)
-        let isVoiceKey = macroText == nil && Pad.voiceKeyIDs.contains(index)
-        // Key index and agent slot are different orderings — the top row is
-        // wired right to left — so the slot lookup goes through the pad map.
-        let slot = Pad.agentSlot(for: index)
-        let agent = slot.flatMap { $0 < bridge.agents.count ? bridge.agents[$0] : nil }
-
-        return Button {
-            if isStackKey {
-                StackPanelController.shared.toggle()
-            } else if isTabCycleKey {
-                Task { await bridge.cycleTabs() }
-            } else if isLandKey {
-                LandPanelController.shared.handleLandKey()
-            } else if let macroText {
-                Task { await bridge.injectPrompt(macroText) }
-            } else if isVoiceKey {
-                VoiceController.shared.handleVoiceKey()
-            } else if let slot, agent != nil {
-                Task { await bridge.focusSlot(slot) }
-            }
-        } label: {
-            RoundedRectangle(cornerRadius: 5)
-                .fill(color ?? Color.secondary.opacity(isBound ? 0.16 : 0.07))
-                .frame(width: 34, height: 26)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 5)
-                        .strokeBorder(Color.secondary.opacity(0.25), lineWidth: 0.5)
-                )
-        }
-        .buttonStyle(.plain)
-        .disabled(agent == nil && !isStackKey && !isTabCycleKey && !isLandKey
-                  && macroText == nil && !isVoiceKey)
-        .help(helpText(index, agent: agent, isStackKey: isStackKey,
-                       isTabCycleKey: isTabCycleKey, isLandKey: isLandKey,
-                       macroText: macroText, isVoiceKey: isVoiceKey))
-    }
-
-    private func helpText(
-        _ index: Int,
-        agent: HerdrAgent?,
-        isStackKey: Bool,
-        isTabCycleKey: Bool,
-        isLandKey: Bool,
-        macroText: String?,
-        isVoiceKey: Bool
-    ) -> String {
-        if isStackKey { return "GitButler stack for the focused agent" }
-        if isTabCycleKey { return "Cycle tabs in the focused Herdr window" }
-        if isLandKey { return "Land the focused agent's branches onto the target" }
-        if let macroText { return "Type: \(macroText)" }
-        if isVoiceKey { return "Right command — start or stop Superwhisper" }
-        if let agent { return "\(agent.shortName) — \(agent.status)" }
-        return "Key \(index)"
-    }
-
-    // MARK: - Agents
-
-    private var agentSection: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if bridge.agents.isEmpty {
-                Text("No agents running")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 14).padding(.vertical, 10)
-            } else {
-                ForEach(Array(bridge.agents.prefix(Pad.agentKeyIDs.count).enumerated()), id: \.offset) { index, agent in
-                    Button {
-                        Task { await bridge.focusSlot(index) }
-                    } label: {
-                        HStack(spacing: 9) {
-                            Circle()
-                                .fill(bridge.keyColors[Pad.agentKeyIDs[index]] ?? Color.secondary.opacity(0.3))
-                                .frame(width: 9, height: 9)
-                            Text("\(index)")
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                            Text(agent.shortName).lineLimit(1)
-                            Spacer(minLength: 8)
-                            Text(agent.status)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .contentShape(Rectangle())
-                        .padding(.horizontal, 14).padding(.vertical, 5)
+        HStack(alignment: .center, spacing: 18) {
+            SessionKeyGrid(
+                selected: Set(bridge.configuration.sessionKeys),
+                colors: bridge.keyColors,
+                keyWidth: 31,
+                keyHeight: 24,
+                onPress: { bridge.handleKeyPress($0) }
+            )
+            VStack(alignment: .leading, spacing: 6) {
+                if bridge.deviceConnected {
+                    Text(bridge.deviceName).font(.caption).lineLimit(2)
+                    if let battery = bridge.battery {
+                        Text(battery).font(.caption2).foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
                 }
-                .padding(.vertical, 4)
+                ForEach([SessionStatus.blocked, .working, .done, .idle, .error], id: \.self) { status in
+                    Label(sessionStatusLabel(status), systemImage: "circle.fill")
+                        .foregroundStyle(sessionColor(status))
+                }
+            }
+            .font(.system(size: 10))
+        }
+        .padding(14)
+        .disabled(bridge.isBusy)
+    }
+
+    private var sessionSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text(bridge.configuration.selection.title).font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(bridge.sessions.count) sessions").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 14).padding(.top, 10).padding(.bottom, 5)
+            if bridge.sessions.isEmpty {
+                Text("No sessions yet. Check the connection in Configure.")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 14).padding(.bottom, 12)
+            } else {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(bridge.sessions) { session in
+                            Button {
+                                Task { await bridge.focusSession(session) }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Circle().fill(sessionColor(session.status)).frame(width: 8, height: 8)
+                                    Text(session.title).lineLimit(1)
+                                    Spacer(minLength: 4)
+                                    if let key = bridge.configuration.sessionKeys.first(where: { bridge.assignments[$0] == session.id }) {
+                                        Text("\(key)")
+                                            .font(.system(.caption2, design: .monospaced))
+                                            .padding(.horizontal, 5).padding(.vertical, 2)
+                                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 3))
+                                    }
+                                    Text(sessionStatusLabel(session.status))
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                .contentShape(Rectangle()).padding(.horizontal, 14).padding(.vertical, 6)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Open this session in \(bridge.configuration.provider.title)")
+                        }
+                    }
+                }
+                .frame(height: min(CGFloat(bridge.sessions.count) * 30, 210))
+                .padding(.bottom, 7)
             }
         }
     }
-
-    // MARK: - Other states
 
     private var permissionBanner: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Label("Input Monitoring is needed", systemImage: "lock.fill")
-                .font(.callout).bold()
-            Text("macOS blocks access to the pad until this app is allowed to monitor input.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            Label("Input Monitoring is needed", systemImage: "lock.fill").font(.callout).bold()
+            Text("Allow Micro Manager to monitor input so it can receive presses from your Micro.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Button("Open Privacy Settings…") {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent") {
                     NSWorkspace.shared.open(url)
                 }
             }
         }
-        .padding(.horizontal, 14).padding(.vertical, 12)
+        .padding(14)
+        .disabled(bridge.isBusy)
     }
 
-    private var idleHint: some View {
-        Text("Switch on to light each agent on its own key.")
-            .font(.callout)
-            .foregroundStyle(.secondary)
+    private func message(_ text: String, color: Color) -> some View {
+        Text(text).font(.caption).foregroundStyle(color)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, 14).padding(.vertical, 12)
+            .padding(.horizontal, 14).padding(.vertical, 8)
     }
-
-    // MARK: - Footer
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack {
+                Button("Configure…") { ConfigurationWindowController.shared.show(bridge) }
+                    .buttonStyle(.borderedProminent)
+                Spacer()
+                Button("Refresh") { Task { await bridge.forceRepaint() } }
+                    .disabled(!bridge.isRunning || bridge.isBusy)
+            }
             Toggle("Open at login", isOn: $launchAtLogin)
                 .toggleStyle(.checkbox)
-                .padding(.horizontal, 14).padding(.top, 8)
                 .onChange(of: launchAtLogin) { enabled in
                     do {
                         if enabled { try SMAppService.mainApp.register() }
                         else { try SMAppService.mainApp.unregister() }
                     } catch {
-                        // Registering only works from a bundled, signed app;
-                        // reflect reality rather than leaving the box ticked.
                         launchAtLogin = SMAppService.mainApp.status == .enabled
+                        inspectorError = error.localizedDescription
                     }
                 }
-
             Toggle("Emulate the pad", isOn: Binding(
                 get: { bridge.emulator != nil },
                 set: { on in
@@ -256,29 +192,36 @@ struct MenuPanelView: View {
                 }
             ))
             .toggleStyle(.checkbox)
-            .padding(.horizontal, 14).padding(.top, 4)
-            .help("Drive a virtual pad instead of the hardware")
-
-            if let inspectorError {
-                Text(inspectorError)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, 14).padding(.top, 6)
-            }
-
             HStack {
-                Button("Refresh") { Task { await bridge.forceRepaint() } }
-                    .disabled(!bridge.isRunning)
+                Button("Try demo") {
+                    Task {
+                        BridgeSettings.emulate = true
+                        await bridge.startDemo()
+                        if let emulator = bridge.emulator {
+                            EmulatorWindowController.shared.show(emulator)
+                        }
+                    }
+                }
+                .help("Show sample sessions on a virtual Micro")
                 Button("Inspector") {
                     inspectorError = nil
                     InspectorLauncher.launch { inspectorError = $0 }
                 }
-                .help("Watch the traffic to and from the pad, and drive its lighting by hand")
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }
             }
-            .padding(.horizontal, 14).padding(.vertical, 8)
+            if let inspectorError {
+                Text(inspectorError).font(.caption).foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
+        .padding(14)
+        .disabled(bridge.isBusy)
     }
+}
+
+func sessionStatusLabel(_ status: SessionStatus) -> String { status.title }
+
+func sessionColor(_ status: SessionStatus) -> Color {
+    Color(packedRGB: SessionAppearance(status: status).color)
 }

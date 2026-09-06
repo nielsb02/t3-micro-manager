@@ -32,23 +32,35 @@ public final class PadEmulator: ObservableObject {
         public var isLit: Bool { brightness > 0 && effect != .off }
     }
 
-    /// Per-key state, including ids past the 13 physical keys — the firmware
-    /// accepts up to AG19 and so does this.
+    /// Lighting state by firmware AG slot, independent of physical position.
+    /// The firmware accepts up to AG19 and so does this.
     @Published public private(set) var keys: [Int: Key] = [:]
-    /// Which key ids are bound to an AG keycode on the active layer, and so
-    /// can light at all. Includes the dial (13, 14) and joystick (15–18).
+    /// Firmware AG slots used by any control on the active layer.
     @Published public private(set) var bound: Set<Int> = []
     @Published public private(set) var keysZone = OAI.Zone.dark
     @Published public private(set) var ambientZone = OAI.Zone.dark
     /// A short tail of RPC traffic, so the window can show what it was told.
     @Published public private(set) var traffic: [String] = []
+    @Published public private(set) var activeLayer = LayerTarget(profileID: 0, layerID: 0)
+
+    public var layers: [DeviceLayer] { (try? LayerMapping.layers(in: keymap)) ?? [] }
 
     /// Set by `WLDevice` to deliver device-pushed notifications.
     var onNotify: ((String, Any?) -> Void)?
 
     private var keymap: [String: Any] = PadEmulator.stockKeymap()
+    private var inputSlots: [Int: Int] = [:]
 
     public init() { refreshBinding() }
+
+    /// Physical buttons use positions 0–12; dial and joystick controls use
+    /// their `Pad` input IDs. Their AG slots come from the active keymap.
+    public func slot(forPhysicalKey key: Int) -> Int? { inputSlots[key] }
+
+    public func light(forPhysicalKey key: Int) -> Key? {
+        guard let slot = slot(forPhysicalKey: key) else { return nil }
+        return keys[slot]
+    }
 
     // MARK: - The RPC surface
 
@@ -64,7 +76,12 @@ public final class PadEmulator: ObservableObject {
 
         case "device.status":
             note("device.status")
-            return (["battery": 87, "is_charging": true, "layer_index": 1], nil)
+            let profiles = keymap["profiles"] as? [[String: Any]] ?? []
+            let profileIndex = profiles.firstIndex { $0["id"] as? Int == activeLayer.profileID }
+            let layers = profileIndex.flatMap { profiles[$0]["layers"] as? [[String: Any]] } ?? []
+            let layerIndex = layers.firstIndex { $0["id"] as? Int == activeLayer.layerID }
+            return (["battery": 87, "is_charging": true,
+                     "profile_index": profileIndex ?? -1, "layer_index": layerIndex.map { $0 + 1 } ?? 0], nil)
 
         case "fs.list":
             note("fs.list")
@@ -89,6 +106,7 @@ public final class PadEmulator: ObservableObject {
                   let config = object as? [String: Any]
             else { return (nil, "bad payload") }
             keymap = config
+            reconcileActiveLayer()
             refreshBinding()
             note("fs.write keymap.json — \(bound.count) keys now bound")
             return (["ok": 1], nil)
@@ -168,14 +186,14 @@ public final class PadEmulator: ObservableObject {
     /// OS, which is not this object's business — so pressing an unbound key
     /// here does nothing, just as it would on the pad.
     public func press(_ key: Int) {
-        guard bound.contains(key) else {
+        guard let slot = slot(forPhysicalKey: key) else {
             note("key \(key) pressed — not AG-bound, so it sent a keystroke instead")
             return
         }
-        note("key \(key) pressed")
-        emit(key: key, act: 1)
+        note("key \(key) pressed — AG\(String(format: "%02d", slot))")
+        emit(key: slot, act: 1)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self] in
-            self?.emit(key: key, act: 0)
+            self?.emit(key: slot, act: 0)
         }
     }
 
@@ -190,26 +208,81 @@ public final class PadEmulator: ObservableObject {
 
     // MARK: - Keymap
 
+    public func activate(_ target: LayerTarget) throws {
+        guard try LayerMapping.layers(in: keymap).contains(where: { $0.target == target }) else {
+            throw LayerMapping.Failure.missingTarget
+        }
+        activeLayer = target
+        keymap["activeProfileId"] = target.profileID
+        refreshBinding()
+        note("active profile \(target.profileID), layer \(target.layerID)")
+    }
+
+    private func reconcileActiveLayer() {
+        let available = layers
+        let activeProfileID = keymap["activeProfileId"] as? Int
+        if activeProfileID == activeLayer.profileID,
+           available.contains(where: { $0.target == activeLayer }) { return }
+        if let layer = available.first(where: { $0.target.profileID == activeProfileID }) {
+            activeLayer = layer.target
+        }
+    }
+
     /// Every key id bound to a `KV_OAI_AG*` code anywhere on the active layer —
     /// the key grid, the encoder, or a joystick sector.
     private func refreshBinding() {
         var found = Set<Int>()
+        var inputs: [Int: Int] = [:]
+        func slot(_ value: Any?) -> Int? {
+            guard let code = value as? String, code.hasPrefix("KV_OAI_AG"),
+                  let slot = Int(code.dropFirst(9)), (0...19).contains(slot) else { return nil }
+            return slot
+        }
         func scan(_ value: Any) {
             if let text = value as? String {
-                if text.hasPrefix("KV_OAI_AG"), let n = Int(text.dropFirst(9)) { found.insert(n) }
+                if let slot = slot(text) { found.insert(slot) }
             } else if let list = value as? [Any] {
                 list.forEach(scan)
             } else if let dict = value as? [String: Any] {
                 dict.values.forEach(scan)
             }
         }
-        let index = keymap["activeProfileId"] as? Int ?? 0
         if let profiles = keymap["profiles"] as? [[String: Any]] {
-            let profile = index < profiles.count ? profiles[index] : profiles.first
-            if let layers = profile?["layers"] as? [[String: Any]], let layer = layers.first {
+            let profile = profiles.first { $0["id"] as? Int == activeLayer.profileID }
+            if let layers = profile?["layers"] as? [[String: Any]],
+               let layer = layers.first(where: { $0["id"] as? Int == activeLayer.layerID }) {
                 scan(layer)
+                if let layout = layer["layout"] as? [String: Any] {
+                    if let matrix = layout["keymap"] as? [[String]] {
+                        for key in 0..<13 {
+                            guard let position = Pad.position(of: key),
+                                  matrix.indices.contains(position.row),
+                                  matrix[position.row].indices.contains(position.column) else { continue }
+                            inputs[key] = slot(matrix[position.row][position.column])
+                        }
+                    }
+                    if let encoders = layout["encoders"] as? [[String]], let dial = encoders.first {
+                        if dial.indices.contains(0) { inputs[Pad.dialUpID] = slot(dial[0]) }
+                        if dial.indices.contains(1) { inputs[Pad.dialDownID] = slot(dial[1]) }
+                    }
+                    if let joystick = layout["joystick"] as? [String: Any],
+                       let sectors = joystick["sectors"] as? [[String: Any]] {
+                        let directions: [(Double, Int)] = [
+                            (0.25, Pad.joyNorthID), (0.50, Pad.joyWestID),
+                            (0.75, Pad.joySouthID), (0.00, Pad.joyEastID),
+                        ]
+                        for sector in sectors {
+                            guard let a1 = number(sector["a1"]), let a2 = number(sector["a2"]),
+                                  let direction = directions.first(where: {
+                                      abs(KeymapManager.sectorCentre(a1, a2) - $0.0) < 0.01
+                                  }) else { continue }
+                            inputs[direction.1] = slot(sector["k"])
+                        }
+                    }
+                }
             }
         }
+        inputSlots = inputs
         bound = found
     }
 
@@ -221,6 +294,7 @@ public final class PadEmulator: ObservableObject {
     /// Reset to a factory pad: stock keymap, every light off.
     public func reset() {
         keymap = PadEmulator.stockKeymap()
+        activeLayer = LayerTarget(profileID: 0, layerID: 0)
         keys = [:]
         keysZone = .dark
         ambientZone = .dark
@@ -233,7 +307,7 @@ public final class PadEmulator: ObservableObject {
     /// a numpad ring on the joystick. Matches a real `fs.read` off a stock
     /// device, which is what makes the app's binding step meaningful here.
     static func stockKeymap() -> [String: Any] {
-        [
+        var config: [String: Any] = [
             "version": 1,
             "activeProfileId": 0,
             "profiles": [[
@@ -267,5 +341,21 @@ public final class PadEmulator: ObservableObject {
                 ]],
             ]],
         ]
+        var profiles = config["profiles"] as! [[String: Any]]
+        var layers = profiles[0]["layers"] as! [[String: Any]]
+        for id in 1...2 {
+            layers.append([
+                "id": id,
+                "name": "Layer \(id + 1)",
+                "layout": [
+                    "keymap": [2, 4, 4, 3].map { Array(repeating: "KC_NONE", count: $0) },
+                    "encoders": [["KC_NONE", "KC_NONE", "KC_NONE"]],
+                    "joystick": ["type": "JOYSTICK", "sectors": []],
+                ],
+            ])
+        }
+        profiles[0]["layers"] = layers
+        config["profiles"] = profiles
+        return config
     }
 }

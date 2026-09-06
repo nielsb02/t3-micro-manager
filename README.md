@@ -1,230 +1,215 @@
-# Micro Manager
+# Micro Manager for T3 Code
 
-A macOS menu-bar app that lights each running [Herdr](https://herdr.dev) agent
-on its own key of a Work Louder
-**[Creator Micro 2](https://worklouder.cc/creator-micro-2)**, and jumps to that agent
-when you press the key.
+A standalone macOS menu-bar app for the Work Louder Creator Micro 2. Show session
+status on buttons, then press a button to open that session. Supports local
+[T3 Code](https://github.com/pingdotgg/t3code), Herdr, and a hardware-free demo.
 
-It is the bridge itself — no Node, no daemon, nothing to install on the Herdr
-side. It reads Herdr's socket directly and drives the pad over raw HID.
+This is a local proof of concept. T3 keys can open the exact session in the
+**desktop app** using the included T3 source patch, or in its browser UI.
+Desktop mode selects the session in the existing window and confirms its ID.
+Stock T3 0.0.38 needs the patch; see [desktop setup](docs/desktop-opening.md).
+Existing configurations retain browser mode until you select the desktop target.
+In **Configure → Connection**, choose **T3 desktop app** and optionally select
+the installation under **Desktop app → Choose…**. This can point to your
+`T3 Code Dev.app` shortcut. Test **Open** beside a session, then **Save settings**;
+no key remapping is required. A selected app is launched when needed, and Micro
+Manager checks that the desktop connection belongs to that app.
 
-**[Download the latest release](https://github.com/schacon/micro-manager/releases/latest/download/MicroManager.zip)**
-· [website](https://schacon.github.io/micro-manager/)
-· [hacking guide](docs/hacking.md)
-
----
-
-## Install
-
-Download, unzip, drag `MicroManager.app` to Applications, and launch it. macOS
-will ask for **Input Monitoring** — grant it, then toggle the manager off and on
-from the menu-bar panel so it reconnects with the permission.
-
-Or build it yourself:
+## Start here
 
 ```bash
-./scripts/bundle.sh --install     # build, sign, install to /Applications, launch
+./scripts/bundle.sh --install
 ```
 
-You will also need a Creator Micro 2 and a running Herdr server with agents in
-it. Quit Work Louder's Input app and the Codex desktop app while you use this —
-all three drive the same lighting and will overwrite each other.
+Choose **Configure** from the keyboard icon in the menu bar. For a quick preview,
+choose **Try demo**. That starts a virtual Micro with changing session lights;
+you can switch its active layer to check that the bridge pauses on other layers.
+The demo does not change hardware or overwrite your saved T3 connection.
 
-## What the pad does
+The app starts disabled on first launch. It does not install bindings on startup
+or reconnect. A device setup requires **Save & apply selected keys**.
 
-**The icon** shows state at a glance: dimmed when off, a coloured dot when
-running — green all idle, amber something working, red something needs you —
-and a badge when the pad is missing or permission is denied.
+## Connect your local T3 instance
 
-**The top six keys** are one agent each, in the order Herdr's own panel lists
-them. Colours are red (blocked, breathing), amber (working), blue (done —
-finished but not yet looked at) and green (idle — finished and seen). Herdr
-distinguishes done from idle by whether you have focused the pane yet, so blue
-means something is waiting to be read and green means quiet. The **underglow**
-carries the worst state across all agents, so "does anything need me?" is
-readable from across the room.
+Keep the existing T3 desktop app running. There is no second T3 server to start.
 
-Pressing an agent key focuses that agent in Herdr **and brings the terminal
-forward** — Herdr selects the pane but leaves the window where it was, so an
-agent key pressed from a browser used to move a cursor you could not see. Set
-`WL_TERMINAL_BUNDLE_ID` if your panes do not live in Ghostty.
-
-**Row 3** is actions:
-
-| key | what it does |
-|---|---|
-| stack | floats the GitButler stack for the focused agent |
-| tabs | cycles the tabs of the focused Herdr window |
-| land | lands the focused agent's branches, bottom first |
-| macro | types a configured string into the agent's prompt |
-
-**Row 4** is the wide key — it taps right command, which starts and stops
-Superwhisper — and one more
-macro key.
-
-**The dial** tunes reasoning effort. **The joystick** switches model: it puts
-the model list on screen, north and south move, east confirms, west cancels.
-
-### The stack key
-
-It floats `but status` in the middle of the screen; press again to put it away.
-The window never takes focus — you are reading it *from* the terminal you were
-already typing in, and a read-only view that steals the keyboard would cost two
-keystrokes to undo. Click the output to select text, click anywhere else to
-dismiss.
-
-`but` is found by search, not by `PATH`: an app launched by launchd inherits
-`/usr/bin:/bin:/usr/sbin:/sbin`, so the binary your terminal finds instantly is
-invisible here. Homebrew and Cargo locations are checked directly, then your
-login shell is asked. Set `WL_BUT_PATH` to skip all of it.
-
-## The panel
-
-Click the menu-bar icon. It draws the pad in its real shape with every key
-showing its live colour, then one row per agent. Click a key or a row to jump to
-that agent. It also carries the on/off switch, an "Open at login" toggle, a
-warning when another app is fighting for the device, and the **Inspector**
-button.
-
-**Off** clears the lights and stops driving, but deliberately leaves the device
-keymap alone: rebinding is a flash write, and the keys light instantly on the
-way back in if the bindings are still there.
-
-## The Inspector
-
-The debug UI ships inside the app — the **Inspector** button in the panel opens
-it. It logs every message in both directions (`TX`, `RX`, `NOTIFY`, `DEVICE`),
-decodes the device's abbreviated notifications, and drives the lighting by hand:
-per-key colours and effects, the two zones, a key walk, and a raw JSON-RPC
-console with presets.
-
-It lives at `MicroManager.app/Contents/Library/Inspector.app`, signed by the
-same identity as its host, so it is one download and one trust decision. During
-development there is no surrounding bundle, so run it directly:
+For the shortest local setup, quit Micro Manager and run:
 
 ```bash
-swift run WLInspector
+python3 scripts/connect-t3.py
 ```
 
-Run that **from your terminal**, not from Finder: macOS attributes Input
-Monitoring to the responsible process, so a terminal that already has the grant
-passes it on.
+The helper uses T3's version-matched CLI to create a pairing grant for the running
+loopback server, exchanges it for Micro Manager's own read-only session, verifies
+session listing, and saves the connection. It downloads the matching CLI through
+`npx` if necessary. It does not enable LAN or public access and does not print
+credentials. Reopen Micro Manager after running it.
 
-## No pad to hand
+Alternatively, in **Configure → Connection**, use **Discover**, paste a pairing
+link from T3's **Settings → Connections**, and choose **Pair**. **Test connection**
+shows session titles and states. Save the settings when the connection works.
+Advanced users can supply a bearer token directly.
 
-Tick **Emulate the pad** in the panel and a window opens with a virtual Creator
-Micro 2 in it. The bridge drives its lights exactly as it drives the hardware,
-and clicking a key — or the dial, or the joystick — sends the same
-`v.oai.hid` report back, so the whole loop works with nothing plugged in.
+For **Browser** mode, pair the browser once too, using a separate T3 pairing link. The helper's
+`--browser` option can create and open one. Session URLs contain environment and
+thread IDs, never Micro Manager's bearer credential. An authenticated browser
+can then open the exact session when you press its key. It may open a new tab on
+each press, according to your browser's behavior.
+
+T3 compatibility was checked against 0.0.38. The session API is internal and may
+change. Expired/revoked credentials require pairing again. Remote environments
+are deferred; this version lists the configured server's own sessions.
+
+## Choose your buttons
+
+1. Connect your Micro. In Configure, choose **Read layers from Micro**.
+2. Grant **Input Monitoring** to Micro Manager if macOS asks. Quit and reopen the
+   app after granting it, then read the layers again.
+3. Select an existing profile/layer by its name. Leave your Codex layer alone.
+4. Click the buttons you want to use as session keys. The initial selection is
+   the top six buttons; every selection is configurable.
+5. Review the selected binding changes and choose **Save & apply selected keys**.
+6. Enable Micro Manager and switch the pad to that layer.
+
+Work Louder Input remains your hardware configurator. Keep the Control+Option
+Wispr Flow shortcut there. The wide microphone key, dial, joystick, and other
+unselected buttons retain their bindings. Choosing a microphone position as a
+session key explicitly replaces that position's shortcut on the selected layer.
+
+Individual status lighting requires the firmware's `KV_OAI_AG…` bindings. The
+app installs those only on selected positions. It uses AG06–AG18, reserving
+AG00–AG05 for Codex. Physical button numbers and firmware slot numbers differ. These keys report presses to the
+bridge instead of typing ordinary shortcuts. Consequently, session keys need
+the bridge enabled; other keys keep working through Input/the device.
+
+The top row is **0, 1** from left to right, in both the controller and Input's
+keymap matrix. Labels, colors, clicks, and physical presses use those same
+position IDs. See the [top-row mapping check](docs/top-row-mapping.md).
+
+All twenty AG slots (AG00–AG19) are shared across layers. A key event identifies
+the slot, without identifying its layer. With the default six T3 buttons,
+Codex uses AG00–AG05, T3 uses AG06–AG11, and AG12–AG19 remain available for another
+integration. Selecting additional T3 buttons uses more of that remaining range.
+Use separate slots for independent apps. Reusing slots between layers requires
+every controller to check the active layer and coordinate the shared LEDs;
+Micro Manager's layer check cannot control another app's behavior. The current
+dashboard manages one provider/layer at a time.
+
+**Restore buttons** restores the previous values for bindings still owned by
+Micro Manager. Later changes made in Input are kept. Restore before moving the
+integration to a different layer. Full device exports and the restoration record
+are saved before device writes; the dashboard can reveal the backup.
+
+If you applied the first build, choose **Save & apply selected keys** once in the
+updated app to migrate its conflicting AG00–AG05 bindings. The saved original
+shortcuts are retained for restoration.
+
+Lighting and hardware key handling are gated by the chosen active layer and a
+matching applied mapping record. The underglow is optional and off by default.
+Codex and Input can also write device lighting. The app reports detected competing
+clients, but coexistence on physical hardware still needs verification. Layer
+selection alone does not stop another app from writing global light state.
+
+## Which sessions appear
+
+- **Recent:** most recent session activity fills the selected buttons.
+- **Pinned:** explicit per-button pins, then sessions pinned in T3.
+- **Pinned + recent:** explicit pins, then T3 pins and recent sessions.
+
+Running sessions and sessions needing input retain their current automatic slot
+as the recent list changes. An explicit pin reserves its key when the session is
+unavailable. The menu lists all sessions, including those beyond the selected
+button count. Explicit pins are stored separately for each provider and restored
+when you switch back. Existing pins migrate automatically on load. Review pins
+when pointing the same provider at a different server.
+
+| Color | State |
+| --- | --- |
+| Amber, pulsing | Approval, input, or plan review needed |
+| Cyan, slow gentle pulse | Running or background work |
+| Green, solid | Finished, waiting to be opened |
+| Muted lavender, solid | Idle / completed response opened |
+| Red, solid | Error |
+| Gray, solid | Unknown or disconnected |
+
+Working uses the firmware's shallow-breath effect at speed `0.25`; input or
+approval uses full breathing at `0.5`. Settled states stay solid. The optional
+ambient light follows the same palette and pulse settings. The menu uses matching
+colors; its status dots and pad preview stay static.
+
+The bridge polls session summaries once per cycle, with a one-second pause
+between cycles. Device reads and network latency can extend the interval. It
+never downloads conversation bodies. A failed connection marks retained sessions
+unknown instead of leaving a stale working or idle color. Opening a completed
+session through Micro Manager (a physical key or the menu) acknowledges it locally
+and changes green to lavender. Reading it directly in T3 is not detected; this is
+not T3's own seen/unseen state.
+Acknowledgements track the completed turn, so a new result becomes green even
+if the entire turn finishes between polls. Herdr retains its own native read state.
+
+Herdr uses its local socket and raises Ghostty after focusing a pane.
+`HERDR_SOCKET_PATH` and `WL_TERMINAL_BUNDLE_ID` still override those defaults.
+The upstream GitButler, model-tuning, and text-macro controls are not assigned by
+this session-focused dashboard. Their source remains available in the fork.
+
+## Configuration and development
+
+Settings live in `~/.config/micromanager/bridge.json`, honoring
+`XDG_CONFIG_HOME`. The file contains the paired token and is written with owner-only
+permissions. Do not share it with colleagues. Each colleague pairs their own app.
+The old `config.json` macro file is retained and is not overwritten.
+
+Providers implement a shared `SessionProvider` interface for session listing and
+opening. `SessionInputProvider` optionally adds text input and named actions;
+unsupported inputs are rejected. T3 currently exposes read/open operations, while
+Herdr supports inserting text without submitting it. Custom input bindings are
+an API extension point, with no dashboard controls assigned yet. See
+[adding a provider](docs/provider-architecture.md) for the contract and examples.
 
 ```bash
-WL_EMULATE=1 swift run WLMicroManager    # start emulated, no clicking required
+swift build
+swift test                           # requires Xcode's XCTest framework
+./scripts/verify-mapping.sh           # also works with Command Line Tools only
+./scripts/verify-t3.sh
+./scripts/verify-desktop.sh           # real local sockets; no running T3 needed
+python3 scripts/verify-signing.py      # temporary certificate + two distinct builds
+./scripts/verify-emulator.sh
+./scripts/verify-bridge.sh            # isolated config + emulator; no hardware
+./scripts/verify-providers.sh         # provider lifecycle, inputs, pins, connection races
+./scripts/verify-bridge.sh --inspect-device  # optional read-only physical probe
 ```
 
-It is a stand-in for the firmware rather than a picture of one, and it
-reproduces the firmware's more awkward habits deliberately, because those are
-the ones that cost time on real hardware:
+`bundle.sh` creates `build/T3MicroManager.app` with the protocol Inspector nested
+inside it. `--install` quits Micro Manager, installs it in
+`/Applications/T3MicroManager.app`, and reopens it. Use this location for everyday
+use and future updates. The fork has its own bundle IDs, so it does not replace
+Work Louder Input or an upstream Micro Manager installation.
 
-- it answers `{"ok":1}` to any lighting payload, right or wrong;
-- it boots on the **stock F-key keymap**, so the app has to bind the keys
-  before anything can light — and a key that is not bound to `KV_OAI_AG*`
-  accepts its colour in silence and stays dark;
-- an unbound key reports nothing when pressed, because on the pad it would be
-  sending a keystroke instead.
+Local builds create a signing certificate once, then reuse it automatically.
+This keeps the app's identity stable across updates so Input Monitoring can
+retain its grant. The private key lives in a dedicated Keychain under
+`~/Library/Application Support/T3MicroManager/Signing`, alongside an owner-only
+password file. Keep this directory private and preserve it between builds.
+The helper locks the keychain after signing and does not add certificate trust
+or change the login keychain. A missing or broken identity fails the build
+instead of silently replacing it. Each colleague building locally gets their
+own identity. No paid Apple developer account is needed for this local setup.
 
-The window also shows the RPC traffic, and **Reset** puts a factory pad back.
+**Switching from an earlier ad-hoc build requires one final grant.** Quit Micro
+Manager, remove its old entry from **System Settings → Privacy & Security →
+Input Monitoring**, and add `/Applications/T3MicroManager.app`. Enable it and
+reopen the app. The old switch may look enabled even when the signature no
+longer matches. Settings and device mappings are preserved.
 
-The emulator lives inside the app, so it stands in for the device for Micro
-Manager only — the Inspector is a separate process and still needs hardware.
+For distribution, explicitly set `WL_SIGN_IDENTITY` to an Apple signing identity.
+Local certificates do not provide notarization or Gatekeeper approval. Setting
+`WL_SIGN_IDENTITY=-` opts into ad-hoc signing; unsigned CI also uses ad-hoc signing
+rather than creating a new local certificate on every runner. Those builds will
+again need permission after updates. See Apple's explanation of
+[code requirements and app identity](https://developer.apple.com/documentation/technotes/tn3127-inside-code-signing-requirements).
 
-## Configuration
-
-Everything works without a config file. To rebind the macro keys or change what
-the dial and joystick offer, drop a `config.json` into
-`~/.config/micromanager/`:
-
-```json
-{
-  "keys": {
-    "9":     "Open PRs for all active GitButler branches",
-    "12":    "Run but pull",
-    "10+11": "Summarise what you are working on"
-  },
-  "claude": { "models": ["fable", "opus"], "efforts": ["low", "high"] },
-  "codex":  { "models": ["gpt-5.6-sol", "gpt-5.6-codex"] }
-}
-```
-
-A bound string is injected into the focused agent's prompt, unsubmitted — you
-still read it and press enter. `"10+11"` addresses the wide key as one; `"10"`
-and `"11"` address its halves. Keys the file does not mention keep their
-defaults, and an empty string unbinds a key outright. Binding the wide key to
-text replaces its right-command tap.
-
-`codex.models` is your copy of what Codex's own `/model` menu offers, in its
-order — the joystick steers that menu rather than owning it, so there is nothing
-to read it from.
-
-| variable | what it overrides |
-|---|---|
-| `WL_TERMINAL_BUNDLE_ID` | the terminal to raise (default Ghostty) |
-| `WL_BUT_PATH` | the GitButler binary, skipping the search |
-| `HERDR_SOCKET_PATH` | the Herdr socket |
-| `WL_SIGN_IDENTITY` | the signing identity `bundle.sh` uses |
-
-## Why it must be bundled and signed
-
-`swift run` works for development because it inherits your terminal's Input
-Monitoring grant. A background app needs its own, and macOS keys that grant to
-the **code signature** — so an ad-hoc signature, whose hash changes on every
-build, forces you to re-grant after every rebuild. `bundle.sh` prefers a real
-Apple Development or Developer ID identity from your keychain, which gives a
-stable designated requirement and makes the grant stick. It also sets
-`LSUIElement` so there is no Dock icon, and gives `SMAppService` a bundle it
-will actually register as a login item.
-
-Every push to main republishes the **`latest`** release, so the download link
-above always points at the current build; tagging `v*` cuts a permanent
-versioned release alongside it. Both go through
-[the release workflow](.github/workflows/release.yml).
-
-That workflow signs with a Developer ID and notarizes when the repository has
-the secrets for it — the file lists them — and falls back to an ad-hoc
-signature when it does not, rather than failing. An ad-hoc build works, but
-macOS stops it until you right-click → Open, and because the grant is keyed to
-the signature and an ad-hoc one changes every build, Input Monitoring has to be
-granted again after each update. The release notes say which kind you are
-downloading.
-
-## Only one bridge at a time
-
-Work Louder's Input app and the Codex desktop app drive this same pad. Running
-two at once means they overwrite each other. The panel detects this — the device
-is opened shared, so we receive other clients' replies, and a response id we
-never issued is a reliable tell.
-
-## Development
-
-```bash
-swift build            # both apps and the shared library
-swift test             # live tests skip themselves without hardware
-swift run WLInspector  # the debug UI
-./scripts/bundle.sh    # assemble build/MicroManager.app, unsigned install
-```
-
-| | |
-|---|---|
-| `Sources/WLKit` | device transport, vendor protocol, Herdr client, bridge engine |
-| `Sources/WLMicroManager` | the menu-bar app and its panels |
-| `Sources/WLInspector` | the debug UI |
-| `docs/hacking.md` | how the pad protocol works, and how to drive it yourself |
-| `docs/index.html` | the website, served by GitHub Pages from `docs/` |
-
-The device protocol — raw-HID JSON-RPC, per-key colour, key and joystick events,
-and the keymap binding that makes per-key lighting possible at all — is written
-up in full in **[docs/hacking.md](docs/hacking.md)**.
-
----
-
-An independent interoperability tool for hardware I own. Not affiliated with
-Work Louder.
+The original [hardware protocol guide](docs/hacking.md) is retained. Its automatic
+first-layer examples describe the upstream implementation; use the dashboard's
+explicit layer selection in this fork. Background research is in
+[port-investigation.md](docs/port-investigation.md) and
+[t3-integration-research.md](docs/t3-integration-research.md).

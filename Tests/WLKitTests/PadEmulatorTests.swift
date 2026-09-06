@@ -17,6 +17,25 @@ final class PadEmulatorTests: XCTestCase {
         return (device, emulator)
     }
 
+    private func write(_ config: [String: Any], to device: WLDevice) async throws {
+        let data = try JSONSerialization.data(withJSONObject: config)
+        _ = try await device.callAsync("fs.write", params: [
+            "file": "keymap.json", "data": String(decoding: data, as: UTF8.self),
+        ])
+    }
+
+    private func replacingBaseLayout(_ edit: (inout [String: Any]) -> Void) -> [String: Any] {
+        var config = PadEmulator.stockKeymap()
+        var profiles = config["profiles"] as! [[String: Any]]
+        var layers = profiles[0]["layers"] as! [[String: Any]]
+        var layout = layers[0]["layout"] as! [String: Any]
+        edit(&layout)
+        layers[0]["layout"] = layout
+        profiles[0]["layers"] = layers
+        config["profiles"] = profiles
+        return config
+    }
+
     func testConnectsWithoutHardware() throws {
         let (device, _) = try connected()
         XCTAssertEqual(device.info?.transport, "emulated")
@@ -135,6 +154,90 @@ final class PadEmulatorTests: XCTestCase {
         }
         emulator.press(0)   // still the stock keymap: nothing is bound
         XCTAssertEqual(reports, 0)
+    }
+
+    func testPhysicalButtonUsesItsBoundSlotForLightPressAndRelease() async throws {
+        let (device, emulator) = try connected()
+        let config = replacingBaseLayout { layout in
+            var matrix = layout["keymap"] as! [[String]]
+            matrix[1][2] = "KV_OAI_AG18" // Physical button 4.
+            layout["keymap"] = matrix
+        }
+        try await write(config, to: device)
+        _ = try await device.callAsync(OAI.methodThreads, params: OAI.threadsParams([
+            OAI.Thread(id: 4, color: 0xFF0000, brightness: 1, effect: .solid),
+            OAI.Thread(id: 18, color: 0x00FF00, brightness: 1, effect: .solid),
+        ]))
+        XCTAssertEqual(emulator.slot(forPhysicalKey: 4), 18)
+        XCTAssertEqual(emulator.light(forPhysicalKey: 4)?.color, 0x00FF00)
+        XCTAssertEqual(emulator.bound, [18])
+        XCTAssertNil(emulator.slot(forPhysicalKey: Pad.joyWestID))
+
+        let release = expectation(description: "release uses the slot captured on press")
+        var seen: [String] = []
+        device.onNotification = { method, params in
+            guard method == OAI.notifyHID, let report = params as? [String: Any],
+                  let code = report["k"] as? String, let action = report["act"] as? Int else { return }
+            seen.append("\(code):\(action)")
+            if action == 0 { release.fulfill() }
+        }
+        emulator.press(4)
+        try emulator.activate(LayerTarget(profileID: 0, layerID: 1))
+        XCTAssertNil(emulator.slot(forPhysicalKey: 4))
+        XCTAssertNil(emulator.light(forPhysicalKey: 4))
+        await fulfillment(of: [release], timeout: 2)
+        XCTAssertEqual(seen, ["AG18:1", "AG18:0"])
+    }
+
+    func testBindingASlotElsewhereDoesNotBindTheSameNumberedControl() async throws {
+        let (device, emulator) = try connected()
+        let config = replacingBaseLayout { layout in
+            var matrix = layout["keymap"] as! [[String]]
+            matrix[0] = ["KV_OAI_AG04", "KV_OAI_AG13"]
+            matrix[1][0] = "KV_OAI_AG15"
+            layout["keymap"] = matrix
+        }
+        try await write(config, to: device)
+        XCTAssertEqual(emulator.bound, [4, 13, 15])
+        let unexpected = expectation(description: "unbound controls do not report another control's slot")
+        unexpected.isInverted = true
+        device.onNotification = { method, _ in
+            if method == OAI.notifyHID { unexpected.fulfill() }
+        }
+        for input in [4, Pad.dialUpID, Pad.joyNorthID] {
+            XCTAssertNil(emulator.slot(forPhysicalKey: input))
+            emulator.press(input)
+        }
+        await fulfillment(of: [unexpected], timeout: 0.15)
+    }
+
+    func testDialAndJoystickResolveTheirActualBindings() async throws {
+        let (device, emulator) = try connected()
+        let config = replacingBaseLayout { layout in
+            layout["encoders"] = [["KV_OAI_AG19", "KV_OAI_AG18", "KC_MPLY"]]
+            layout["joystick"] = ["type": "RADIAL", "sectors": [
+                ["k": "KV_OAI_AG11", "a1": 0.1875, "a2": 0.3125],
+                ["k": "KV_OAI_AG10", "a1": 0.4375, "a2": 0.5625],
+                ["k": "KV_OAI_AG09", "a1": 0.6875, "a2": 0.8125],
+                ["k": "KV_OAI_AG08", "a1": 0.9375, "a2": 0.0625],
+            ]]
+        }
+        try await write(config, to: device)
+        let presses = expectation(description: "all bound dial and joystick controls report")
+        presses.expectedFulfillmentCount = 6
+        var seen: [Int] = []
+        device.onNotification = { method, params in
+            guard method == OAI.notifyHID, let report = params as? [String: Any],
+                  report["act"] as? Int == 1, let slot = OAI.agIndex(report["k"] as? String) else { return }
+            seen.append(slot)
+            presses.fulfill()
+        }
+        for input in [Pad.dialUpID, Pad.dialDownID, Pad.joyNorthID, Pad.joyWestID,
+                      Pad.joySouthID, Pad.joyEastID] {
+            emulator.press(input)
+        }
+        await fulfillment(of: [presses], timeout: 2)
+        XCTAssertEqual(seen, [19, 18, 11, 10, 9, 8])
     }
 
     func testResetReturnsAStockPad() async throws {

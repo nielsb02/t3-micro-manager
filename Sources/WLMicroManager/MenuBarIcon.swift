@@ -18,6 +18,9 @@ enum MenuBarIcon {
         case allIdle
         case working
         case blocked
+        case finished
+        case error
+        case unknown
 
         /// Derived from the bridge, in the order that matters: problems first,
         /// then attention, then activity.
@@ -28,9 +31,12 @@ enum MenuBarIcon {
             if !bridge.deviceConnected { return .deviceMissing }
             guard let state = bridge.aggregateState else { return .idle }
             switch state {
-            case "blocked": return .blocked
-            case "working": return .working
-            default: return .allIdle
+            case .blocked: return .blocked
+            case .working: return .working
+            case .done: return .finished
+            case .idle: return .allIdle
+            case .error: return .error
+            case .unknown: return .unknown
             }
         }
 
@@ -39,7 +45,7 @@ enum MenuBarIcon {
             case .off: return "keyboard"
             case .permissionDenied, .deviceMissing: return "keyboard.badge.exclamationmark"
             case .idle: return "keyboard"
-            case .allIdle, .working, .blocked: return "keyboard.fill"
+            case .allIdle, .working, .blocked, .finished, .error, .unknown: return "keyboard.fill"
             }
         }
 
@@ -49,9 +55,12 @@ enum MenuBarIcon {
             case .off, .idle: return nil
             case .permissionDenied: return .systemRed
             case .deviceMissing: return .systemGray
-            case .allIdle: return NSColor(srgbRed: 0, green: 0.78, blue: 0.33, alpha: 1)
-            case .working: return NSColor(srgbRed: 1, green: 0.63, blue: 0, alpha: 1)
-            case .blocked: return NSColor(srgbRed: 1, green: 0.18, blue: 0.18, alpha: 1)
+            case .allIdle: return NSColor(sessionColor(.idle))
+            case .working: return NSColor(sessionColor(.working))
+            case .blocked: return NSColor(sessionColor(.blocked))
+            case .finished: return NSColor(sessionColor(.done))
+            case .error: return NSColor(sessionColor(.error))
+            case .unknown: return NSColor(sessionColor(.unknown))
             }
         }
 
@@ -64,6 +73,9 @@ enum MenuBarIcon {
             case .allIdle: return "All agents idle"
             case .working: return "An agent is working"
             case .blocked: return "An agent needs you"
+            case .finished: return "An agent has finished"
+            case .error: return "An agent has an error"
+            case .unknown: return "Session status is unavailable"
             }
         }
     }

@@ -30,16 +30,21 @@ jobs:
       - name: Test
         run: swift test
 
+      - name: Provider and bridge regression checks
+        run: |
+          ./scripts/verify-providers.sh
+          ./scripts/verify-bridge.sh
+
       - name: Bundle
         run: ./scripts/bundle.sh
 
       # ditto, not zip: the app is a bundle with a nested app inside it, and
       # only ditto preserves the symlinks and the code signature.
       - name: Package
-        run: ditto -c -k --keepParent build/MicroManager.app MicroManager.zip
+        run: ditto -c -k --keepParent build/T3MicroManager.app T3MicroManager.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MicroManager-adhoc-signed
-          path: MicroManager.zip
+          name: T3MicroManager-adhoc-signed
+          path: T3MicroManager.zip
           retention-days: 14

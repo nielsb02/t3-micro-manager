@@ -103,7 +103,7 @@ jobs:
             echo "title=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
             echo "rolling=false" >> "$GITHUB_OUTPUT"
           else
-            echo "WL_VERSION=0.1.$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
+            echo "WL_VERSION=0.2.$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
             echo "tag=latest" >> "$GITHUB_OUTPUT"
             echo "title=Latest build (main)" >> "$GITHUB_OUTPUT"
             echo "rolling=true" >> "$GITHUB_OUTPUT"
@@ -115,7 +115,7 @@ jobs:
         run: ./scripts/bundle.sh
 
       - name: Package
-        run: ditto -c -k --keepParent build/MicroManager.app MicroManager.zip
+        run: ditto -c -k --keepParent build/T3MicroManager.app T3MicroManager.zip
 
       - name: Notarize
         if: steps.mode.outputs.signed == 'true'
@@ -125,7 +125,7 @@ jobs:
           NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: |
           echo "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
-          xcrun notarytool submit MicroManager.zip \
+          xcrun notarytool submit T3MicroManager.zip \
             --key "$RUNNER_TEMP/notary.p8" \
             --key-id "$NOTARY_KEY_ID" \
             --issuer "$NOTARY_ISSUER_ID" \
@@ -138,16 +138,16 @@ jobs:
       - name: Staple and repackage
         if: steps.mode.outputs.signed == 'true'
         run: |
-          xcrun stapler staple build/MicroManager.app
-          xcrun stapler validate build/MicroManager.app
-          rm -f MicroManager.zip
-          ditto -c -k --keepParent build/MicroManager.app MicroManager.zip
+          xcrun stapler staple build/T3MicroManager.app
+          xcrun stapler validate build/T3MicroManager.app
+          rm -f T3MicroManager.zip
+          ditto -c -k --keepParent build/T3MicroManager.app T3MicroManager.zip
 
       - name: Verify the signature
         run: |
-          codesign --verify --deep --strict --verbose=2 build/MicroManager.app
+          codesign --verify --deep --strict --verbose=2 build/T3MicroManager.app
           if [[ "${{ steps.mode.outputs.signed }}" == "true" ]]; then
-            spctl --assess --type execute --verbose=2 build/MicroManager.app
+            spctl --assess --type execute --verbose=2 build/T3MicroManager.app
           fi
 
       - name: Write the release notes
@@ -168,7 +168,7 @@ jobs:
               echo "> **Ad-hoc signed.** The repository has no Developer ID secrets set, so macOS will refuse this build until you right-click the app and choose *Open*. The Input Monitoring grant is keyed to the code signature, and an ad-hoc one changes every build, so you will have to grant it again after each update."
             fi
             echo
-            echo "Unzip, drag \`MicroManager.app\` to Applications, launch it, and grant Input Monitoring."
+            echo "Unzip, drag \`T3MicroManager.app\` to Applications, launch it, and grant Input Monitoring."
           } > notes.md
 
       - name: Publish
@@ -182,7 +182,7 @@ jobs:
           if [[ "${{ steps.version.outputs.rolling }}" == "true" ]]; then
             gh release delete "$TAG" --cleanup-tag --yes || true
           fi
-          gh release create "$TAG" MicroManager.zip \
+          gh release create "$TAG" T3MicroManager.zip \
             --title "$TITLE" \
             --notes-file notes.md \
             --target "$GITHUB_SHA"

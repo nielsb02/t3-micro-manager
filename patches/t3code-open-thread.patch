@@ -1,0 +1,347 @@
+diff --git a/apps/desktop/src/app/DesktopAppActivation.test.ts b/apps/desktop/src/app/DesktopAppActivation.test.ts
+index d6ce8032..de124733 100644
+--- a/apps/desktop/src/app/DesktopAppActivation.test.ts
++++ b/apps/desktop/src/app/DesktopAppActivation.test.ts
+@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
+ import * as NodePath from "node:path";
+ 
+ import {
++  EnvironmentId,
+   ProjectId,
+   ThreadId,
+   type DesktopAppActivationRequest,
+@@ -62,6 +63,75 @@ function exchange(address: string, payload: DesktopAppActivationRequest) {
+ }
+ 
+ describe("desktop app control server", () => {
++  it.effect("roundtrips an open-thread request and a renderer rejection", () =>
++    Effect.gen(function* () {
++      const platform = yield* HostProcessPlatform;
++      const userId = yield* HostProcessUserId;
++      yield* Effect.promise(async () => {
++        const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-thread-open-"));
++        const target = makeTarget(NodePath.join(root, "userdata"), platform, userId);
++        const environmentId = EnvironmentId.make("target-environment");
++        const threadId = ThreadId.make("thread/with space 雪");
++        const projectId = ProjectId.make("project-1");
++        const navigated: Array<{ environmentId: EnvironmentId; threadId: ThreadId }> = [];
++        const server = await startDesktopAppControlServer({
++          ...target,
++          userId,
++          cancel: () => undefined,
++          handle: async (input) => {
++            if (input.type !== "open-thread") throw new Error("Unexpected request type");
++            if (input.threadId !== threadId) {
++              return {
++                version: 1,
++                requestId: input.requestId,
++                ok: false,
++                code: "thread-open-failed",
++                message: "Missing session",
++              };
++            }
++            navigated.push({ environmentId: input.environmentId, threadId: input.threadId });
++            return {
++              version: 1,
++              requestId: input.requestId,
++              ok: true,
++              environmentId: input.environmentId,
++              threadId: input.threadId,
++              projectId,
++            };
++          },
++        });
++        openServers.push(server);
++        const payload = {
++          version: 1,
++          requestId: "exact-session",
++          type: "open-thread",
++          environmentId,
++          threadId,
++        } as const;
++        expect(await exchange(target.address, payload)).toEqual({
++          version: 1,
++          requestId: "exact-session",
++          ok: true,
++          projectId,
++          environmentId,
++          threadId,
++        });
++        expect(navigated).toEqual([{ environmentId, threadId }]);
++        expect(
++          await exchange(target.address, {
++            ...payload,
++            requestId: "missing-session",
++            threadId: ThreadId.make("missing"),
++          }),
++        ).toMatchObject({ ok: false, code: "thread-open-failed" });
++        expect(navigated).toHaveLength(1);
++        await server.close();
++        openServers.splice(openServers.indexOf(server), 1);
++        await NodeFSP.rm(root, { recursive: true, force: true });
++      });
++    }),
++  );
++
+   it.effect("roundtrips a request and removes its socket on shutdown", () =>
+     Effect.gen(function* () {
+       const platform = yield* HostProcessPlatform;
+diff --git a/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx b/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
+index 3e941e69..33663aef 100644
+--- a/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
++++ b/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
+@@ -1,19 +1,23 @@
+ import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+ import type { DesktopAppActivationRequest } from "@t3tools/contracts";
++import { useNavigate } from "@tanstack/react-router";
+ import { useEffect, useEffectEvent, useRef } from "react";
+ 
+ import { handleDesktopAppActivationRequest } from "../../desktopAppActivation";
+ import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
+ import { findProjectByPath, inferProjectTitleFromPath } from "../../lib/projectPaths";
+ import { newProjectId } from "../../lib/utils";
+-import { readProjects, waitForProject } from "../../state/entities";
+-import { usePrimaryEnvironment } from "../../state/environments";
++import { readProjects, readThreadShell, waitForProject } from "../../state/entities";
++import { useEnvironments, usePrimaryEnvironment } from "../../state/environments";
+ import { projectEnvironment } from "../../state/projects";
+ import { useEnvironmentQuery } from "../../state/query";
+ import { environmentShell } from "../../state/shell";
+ import { useAtomCommand } from "../../state/use-atom-command";
++import { buildThreadRouteParams } from "../../threadRoutes";
+ 
+ export function DesktopAppActivationCoordinator() {
++  const navigate = useNavigate();
++  const { environments } = useEnvironments();
+   const primaryEnvironment = usePrimaryEnvironment();
+   const createProject = useAtomCommand(projectEnvironment.create, { reportFailure: false });
+   const openThread = useNewThreadHandler();
+@@ -32,6 +36,19 @@ export function DesktopAppActivationCoordinator() {
+ 
+   const processRequest = useEffectEvent(async (request: DesktopAppActivationRequest) =>
+     handleDesktopAppActivationRequest(request, {
++      isEnvironmentConnected: (environmentId) =>
++        environments.some(
++          (environment) =>
++            environment.environmentId === environmentId &&
++            environment.connection.phase === "connected",
++        ),
++      findThread: (ref) => {
++        const thread = readThreadShell(ref);
++        return thread?.archivedAt == null ? thread : null;
++      },
++      navigateThread: async (ref) => {
++        await navigate({ to: "/$environmentId/$threadId", params: buildThreadRouteParams(ref) });
++      },
+       getTarget: () => {
+         if (
+           primaryEnvironment?.connection.phase !== "connected" ||
+diff --git a/apps/web/src/desktopAppActivation.test.ts b/apps/web/src/desktopAppActivation.test.ts
+index e362391e..98c89c62 100644
+--- a/apps/web/src/desktopAppActivation.test.ts
++++ b/apps/web/src/desktopAppActivation.test.ts
+@@ -22,6 +22,9 @@ function dependencies(
+   overrides: Partial<DesktopAppActivationDependencies> = {},
+ ): DesktopAppActivationDependencies {
+   return {
++    isEnvironmentConnected: (id) => id === environmentId,
++    findThread: () => ({ projectId: existingProjectId }),
++    navigateThread: vi.fn(async () => undefined),
+     getTarget: () => ({ environmentId, platform: "linux" }),
+     findProject: () => ({
+       id: existingProjectId,
+@@ -36,6 +39,76 @@ function dependencies(
+ }
+ 
+ describe("desktop app activation", () => {
++  const openExisting = {
++    version: 1,
++    requestId: "open-existing",
++    type: "open-thread",
++    environmentId,
++    threadId,
++  } as const;
++
++  it("navigates to the exact existing session without creating a project or thread", async () => {
++    const deps = dependencies();
++    const response = await handleDesktopAppActivationRequest(openExisting, deps);
++    expect(response).toEqual({
++      version: 1,
++      requestId: "open-existing",
++      ok: true,
++      environmentId,
++      threadId,
++      projectId: existingProjectId,
++    });
++    expect(deps.navigateThread).toHaveBeenCalledWith({ environmentId, threadId });
++    expect(deps.createProject).not.toHaveBeenCalled();
++    expect(deps.openThread).not.toHaveBeenCalled();
++  });
++
++  it("does not substitute the primary environment for an unavailable target", async () => {
++    const deps = dependencies();
++    const response = await handleDesktopAppActivationRequest(
++      { ...openExisting, environmentId: EnvironmentId.make("other") },
++      deps,
++    );
++    expect(response).toMatchObject({ ok: false, code: "environment-unavailable" });
++    expect(deps.navigateThread).not.toHaveBeenCalled();
++  });
++
++  it("reports a missing session without creating a replacement", async () => {
++    const deps = dependencies({ findThread: () => null });
++    const response = await handleDesktopAppActivationRequest(openExisting, deps);
++    expect(response).toMatchObject({ ok: false, code: "thread-open-failed" });
++    expect(deps.navigateThread).not.toHaveBeenCalled();
++    expect(deps.openThread).not.toHaveBeenCalled();
++  });
++
++  it("reports a navigation failure instead of acknowledging an unopened session", async () => {
++    const deps = dependencies({
++      navigateThread: vi.fn(async () => {
++        throw new Error("Navigation failed.");
++      }),
++    });
++    const response = await handleDesktopAppActivationRequest(openExisting, deps);
++    expect(response).toMatchObject({
++      ok: false,
++      code: "thread-open-failed",
++      message: "Navigation failed.",
++    });
++  });
++
++  it("uses the requested connected environment even when it is not the primary", async () => {
++    const otherId = EnvironmentId.make("other");
++    const deps = dependencies({
++      isEnvironmentConnected: () => true,
++      findThread: vi.fn(() => ({ projectId: existingProjectId })),
++    });
++    const response = await handleDesktopAppActivationRequest(
++      { ...openExisting, environmentId: otherId },
++      deps,
++    );
++    expect(response).toMatchObject({ ok: true, environmentId: otherId, threadId });
++    expect(deps.findThread).toHaveBeenCalledWith({ environmentId: otherId, threadId });
++    expect(deps.navigateThread).toHaveBeenCalledWith({ environmentId: otherId, threadId });
++  });
+   it("reuses an existing project and opens a new thread", async () => {
+     const deps = dependencies();
+ 
+diff --git a/apps/web/src/desktopAppActivation.ts b/apps/web/src/desktopAppActivation.ts
+index d291e7ed..acad574d 100644
+--- a/apps/web/src/desktopAppActivation.ts
++++ b/apps/web/src/desktopAppActivation.ts
+@@ -6,6 +6,7 @@ import type {
+   ExecutionEnvironmentPlatformOs,
+   ProjectId,
+   ScopedProjectRef,
++  ScopedThreadRef,
+   ThreadId,
+ } from "@t3tools/contracts";
+ 
+@@ -21,6 +22,9 @@ export interface DesktopAppActivationTarget {
+ }
+ 
+ export interface DesktopAppActivationDependencies {
++  readonly isEnvironmentConnected: (environmentId: EnvironmentId) => boolean;
++  readonly findThread: (ref: ScopedThreadRef) => { readonly projectId: ProjectId } | null;
++  readonly navigateThread: (ref: ScopedThreadRef) => Promise<void>;
+   readonly getTarget: () => DesktopAppActivationTarget | null;
+   readonly findProject: (
+     environmentId: EnvironmentId,
+@@ -45,7 +49,7 @@ function failure(
+ }
+ 
+ function desktopPlatformToEnvironmentOs(
+-  platform: DesktopAppActivationRequest["platform"],
++  platform: Extract<DesktopAppActivationRequest, { type: "open-workspace" }>["platform"],
+ ): ExecutionEnvironmentPlatformOs {
+   return platform === "win32" ? "windows" : platform;
+ }
+@@ -58,6 +62,41 @@ export async function handleDesktopAppActivationRequest(
+   request: DesktopAppActivationRequest,
+   dependencies: DesktopAppActivationDependencies,
+ ): Promise<DesktopAppActivationResponse> {
++  if (request.type === "open-thread") {
++    const ref = { environmentId: request.environmentId, threadId: request.threadId };
++    if (!dependencies.isEnvironmentConnected(ref.environmentId)) {
++      return failure(
++        request.requestId,
++        "environment-unavailable",
++        "Connect this environment in the T3 desktop app first.",
++      );
++    }
++    const thread = dependencies.findThread(ref);
++    if (thread === null) {
++      return failure(
++        request.requestId,
++        "thread-open-failed",
++        "This session is not available in the T3 desktop app.",
++      );
++    }
++    try {
++      await dependencies.navigateThread(ref);
++      return {
++        version: 1,
++        requestId: request.requestId,
++        ok: true,
++        projectId: thread.projectId,
++        environmentId: ref.environmentId,
++        threadId: ref.threadId,
++      };
++    } catch (error) {
++      return failure(
++        request.requestId,
++        "thread-open-failed",
++        errorMessage(error, "T3 Code could not open the session."),
++      );
++    }
++  }
+   const target = dependencies.getTarget();
+   if (target === null) {
+     return failure(
+diff --git a/packages/contracts/src/desktopAppActivation.ts b/packages/contracts/src/desktopAppActivation.ts
+index 020188cf..6ae0f234 100644
+--- a/packages/contracts/src/desktopAppActivation.ts
++++ b/packages/contracts/src/desktopAppActivation.ts
+@@ -1,19 +1,30 @@
+ import * as Schema from "effect/Schema";
+ 
+-import { ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
++import { EnvironmentId, ProjectId, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+ 
+ export const DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION = 1 as const;
+ 
+ export const DesktopAppActivationPlatform = Schema.Literals(["darwin", "linux", "win32"]);
+ export type DesktopAppActivationPlatform = typeof DesktopAppActivationPlatform.Type;
+ 
+-export const DesktopAppActivationRequest = Schema.Struct({
++export const DesktopAppOpenWorkspaceRequest = Schema.Struct({
+   version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
+   requestId: TrimmedNonEmptyString,
+   type: Schema.Literal("open-workspace"),
+   workspaceRoot: TrimmedNonEmptyString,
+   platform: DesktopAppActivationPlatform,
+ });
++export const DesktopAppOpenThreadRequest = Schema.Struct({
++  version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
++  requestId: TrimmedNonEmptyString,
++  type: Schema.Literal("open-thread"),
++  environmentId: EnvironmentId,
++  threadId: ThreadId,
++});
++export const DesktopAppActivationRequest = Schema.Union([
++  DesktopAppOpenWorkspaceRequest,
++  DesktopAppOpenThreadRequest,
++]);
+ export type DesktopAppActivationRequest = typeof DesktopAppActivationRequest.Type;
+ 
+ export const DesktopAppActivationErrorCode = Schema.Literals([
+@@ -34,6 +45,7 @@ export const DesktopAppActivationSuccess = Schema.Struct({
+   ok: Schema.Literal(true),
+   projectId: ProjectId,
+   threadId: ThreadId,
++  environmentId: Schema.optional(EnvironmentId),
+ });
+ export type DesktopAppActivationSuccess = typeof DesktopAppActivationSuccess.Type;
+ 
