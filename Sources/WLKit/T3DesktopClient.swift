@@ -151,18 +151,18 @@ public enum T3DesktopClient {
     static func exchange(path: String, payload: Data, timeout: TimeInterval = 16,
                          expectedProcessID: pid_t? = nil, waitForStart: Bool = false) throws -> Data {
         let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        let fd: Int32
-        while true {
-            do {
-                fd = try connectSocket(path: path, deadline: deadline)
-                break
-            } catch T3DesktopError.unavailable where waitForStart {
-                let remaining = deadline - ProcessInfo.processInfo.systemUptime
-                guard remaining > 0 else { throw T3DesktopError.timeout }
-                // Retry only before connecting; never replay a delivered navigation request.
-                usleep(useconds_t(min(remaining, 0.1) * 1_000_000))
+        let fd: Int32 = try {
+            while true {
+                do {
+                    return try connectSocket(path: path, deadline: deadline)
+                } catch T3DesktopError.unavailable where waitForStart {
+                    let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                    guard remaining > 0 else { throw T3DesktopError.timeout }
+                    // Retry only before connecting; never replay a delivered navigation request.
+                    usleep(useconds_t(min(remaining, 0.1) * 1_000_000))
+                }
             }
-        }
+        }()
         defer { Darwin.close(fd) }
         if let expectedProcessID {
             var peer: pid_t = 0
