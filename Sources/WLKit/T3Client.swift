@@ -113,19 +113,63 @@ public enum T3Error: LocalizedError {
         return components.url?.absoluteString
     }
 
-    public nonisolated static func parseShell(data: Data, environmentID: String) throws -> [AgentSession] {
+    public nonisolated static func parseShell(data: Data, environmentID: String, now: Date = Date()) throws -> [AgentSession] {
         guard let shell = try? JSONDecoder().decode(Shell.self, from: data),
               shell.threads.allSatisfy({ !$0.id.isEmpty && !$0.title.isEmpty }),
               Set(shell.threads.map(\.id)).count == shell.threads.count else { throw T3Error.badResponse }
         let directories = Dictionary(shell.projects.map { ($0.id, $0.workspaceRoot) }, uniquingKeysWith: { first, _ in first })
-        return shell.threads.filter { $0.archivedAt == nil && $0.deletedAt == nil }.map { thread in
+        let visible = shell.threads.filter { $0.archivedAt == nil && $0.deletedAt == nil }
+        let ranks = sidebarRanks(visible, now: now)
+        return visible.map { thread in
             AgentSession(id: thread.id, title: thread.title, status: thread.status,
                          updatedAt: thread.latestUserMessageAt ?? thread.latestTurn?.requestedAt ?? thread.updatedAt,
                          isPinned: thread.pinnedAt != nil, environmentID: environmentID,
                          directory: thread.worktreePath ?? directories[thread.projectId],
                          completionID: thread.latestTurn?.turnId ?? thread.latestTurn?.completedAt
-                            ?? thread.latestTurn?.requestedAt)
+                            ?? thread.latestTurn?.requestedAt, providerOrder: ranks[thread.id])
         }
+    }
+
+    /// Mirrors T3's threadSort.ts and threadSettled.ts for the pinned + active sections.
+    private nonisolated static func sidebarRanks(_ threads: [Thread], now: Date) -> [String: Int] {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let whole = ISO8601DateFormatter()
+        func timestamp(_ value: String?) -> TimeInterval? {
+            guard let value else { return nil }
+            return (fractional.date(from: value) ?? whole.date(from: value))?.timeIntervalSince1970
+        }
+        func newer(_ left: String?, than right: String?) -> Bool {
+            guard let left = timestamp(left), let right = timestamp(right) else { return false }
+            return left > right
+        }
+        let active = threads.filter { thread in
+            guard thread.settledOverride != "settled" else { return false }
+            guard let wake = timestamp(thread.snoozedUntil), wake > now.timeIntervalSince1970 else { return true }
+            // Pending input, fresh errors and completions wake snoozed threads early in T3.
+            if thread.hasPendingApprovals || thread.hasPendingUserInput { return true }
+            if thread.session?.status == "error",
+               thread.snoozedAt == nil || newer(thread.session?.updatedAt, than: thread.snoozedAt) { return true }
+            return thread.latestTurn?.state == "completed"
+                && newer(thread.latestTurn?.completedAt, than: thread.snoozedAt)
+        }.map { thread in
+            (thread: thread,
+             key: thread.pinnedAt != nil ? thread.pinOrderKey : thread.activeOrderKey,
+             anchor: thread.pinnedAt != nil ? timestamp(thread.createdAt) ?? 0
+                : max(timestamp(thread.createdAt) ?? 0, timestamp(thread.unsettledAt) ?? 0))
+        }.sorted { left, right in
+            let pinned = left.thread.pinnedAt != nil
+            if pinned != (right.thread.pinnedAt != nil) { return pinned }
+            if (left.key == nil) != (right.key == nil) {
+                // Pins with manual positions lead; new/reopened active threads lead manual positions.
+                return pinned ? left.key != nil : left.key == nil
+            }
+            if let leftKey = left.key, let rightKey = right.key {
+                if leftKey != rightKey { return leftKey < rightKey }
+            } else if left.anchor != right.anchor { return left.anchor > right.anchor }
+            return left.thread.id < right.thread.id
+        }
+        return Dictionary(uniqueKeysWithValues: active.enumerated().map { ($0.element.thread.id, $0.offset) })
     }
 
     private func baseURL() throws -> URL {
@@ -184,7 +228,7 @@ public enum T3Error: LocalizedError {
     private struct TokenResponse: Decodable { let access_token: String; let token_type: String; let scope: String }
     private struct Shell: Decodable { let threads: [Thread]; let projects: [Project] }
     private struct Project: Decodable { let id: String; let workspaceRoot: String }
-    private struct Session: Decodable { let status: String }
+    private struct Session: Decodable { let status: String; let updatedAt: String? }
     private struct Turn: Decodable {
         let turnId: String?
         let state: String
@@ -195,10 +239,17 @@ public enum T3Error: LocalizedError {
         let id: String
         let projectId: String
         let title: String
+        let createdAt: String?
         let updatedAt: String
         let latestUserMessageAt: String?
         let worktreePath: String?
         let pinnedAt: String?
+        let pinOrderKey: String?
+        let activeOrderKey: String?
+        let unsettledAt: String?
+        let settledOverride: String?
+        let snoozedAt: String?
+        let snoozedUntil: String?
         let archivedAt: String?
         let deletedAt: String?
         let session: Session?

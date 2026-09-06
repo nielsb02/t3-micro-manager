@@ -40,6 +40,7 @@ enum FixtureFailure: Error { case offline }
                      "Run through scripts/verify-providers.sh to isolate settings and emulator backups.")
         try pinsAndLegacyConfiguration()
         try await previewConnectionReuse()
+        try await providerOrdering()
         try await lifetimeAndAcknowledgements()
         try await nativeAcknowledgements()
         try await optionalInputs()
@@ -137,6 +138,36 @@ enum FixtureFailure: Error { case offline }
         precondition(instances[1].listCalls == 2 && instances[1].opened == [sessions[0].id])
         precondition(bridge.configuration != settings && bridge.sessions.isEmpty)
         print("Testing and opening a draft reuse an isolated preview connection.")
+    }
+
+    @MainActor static func providerOrdering() async throws {
+        try SessionConfiguration().save()
+        let provider = FixtureProvider()
+        provider.snapshot = [
+            AgentSession(id: "a", title: "A", status: .working, providerOrder: 1),
+            AgentSession(id: "b", title: "B", status: .blocked, providerOrder: 0),
+            AgentSession(id: "history", title: "History", status: .done)
+        ]
+        let bridge = BridgeController(providerFactory: { _ in provider })
+        await bridge.startDemo()
+        var settings = bridge.configuration
+        settings.provider = .t3; settings.selection = .providerOrder
+        settings.sessionKeys = [0, 1]; settings.pinnedSessions = [0: "history"]
+        await bridge.saveConfiguration(settings)
+        precondition(bridge.lastError == nil && bridge.keymapReady && bridge.layerActive)
+        precondition(bridge.sessions.map(\.id) == ["b", "a"] && bridge.assignments == [0: "b", 1: "a"])
+        provider.snapshot[0].providerOrder = 0; provider.snapshot[1].providerOrder = 1
+        await bridge.forceRepaint()
+        precondition(bridge.sessions.map(\.id) == ["a", "b"] && bridge.assignments == [0: "a", 1: "b"])
+        bridge.emulator!.press(0)
+        try await until { !provider.opened.isEmpty }
+        precondition(provider.opened == ["a"], "After a drag, the physical key opens the newly displayed session")
+        provider.snapshot[0].providerOrder = nil
+        await bridge.forceRepaint()
+        precondition(bridge.sessions.map(\.id) == ["b"] && bridge.assignments == [0: "b"])
+        precondition(bridge.configuration.pinnedSessions == [0: "history"], "Local pins remain saved")
+        await bridge.stop()
+        print("Provider rearrangement updates the menu, keys and physical press routing together.")
     }
 
     @MainActor static func nativeAcknowledgements() async throws {

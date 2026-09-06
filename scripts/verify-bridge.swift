@@ -54,6 +54,25 @@ import Foundation
         precondition(SessionAssignments.assign(sessions, configuration: cfg).count == 1)
         print("Session assignment checks passed.")
 
+        cfg.selection = .providerOrder
+        let arranged = [
+            AgentSession(id: "first", title: "First", status: .working, providerOrder: 0),
+            AgentSession(id: "second", title: "Second", status: .blocked, providerOrder: 1),
+            AgentSession(id: "history", title: "History", status: .done)
+        ]
+        precondition(SessionAssignments.assign(Array(arranged.reversed()), configuration: cfg, previous: [1: "second", 0: "first"])
+                     == [1: "first", 0: "second"], "App order overrides old working slots and local pins")
+        var moved = arranged
+        moved[0].providerOrder = 1; moved[1].providerOrder = 0
+        precondition(SessionAssignments.assign(moved, configuration: cfg, previous: [1: "first", 0: "second"])
+                     == [1: "second", 0: "first"], "Provider drag order must reach physical key assignments")
+        moved[1].providerOrder = nil
+        precondition(SessionAssignments.assign(moved, configuration: cfg) == [1: "first"],
+                     "Settled sessions must not fill spare keys")
+        let restored = try JSONDecoder().decode(SessionConfiguration.self, from: JSONEncoder().encode(cfg))
+        precondition(restored == cfg)
+        print("App ordering, live rearrangement, excluded history and configuration round-trip passed.")
+
         let bridge = BridgeController()
         await bridge.startDemo()
         precondition(bridge.lastError == nil, bridge.lastError ?? "")

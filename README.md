@@ -115,8 +115,19 @@ selection alone does not stop another app from writing global light state.
 - **Recent:** most recent session activity fills the selected buttons.
 - **Pinned:** explicit per-button pins, then sessions pinned in T3.
 - **Pinned + recent:** explicit pins, then T3 pins and recent sessions.
+- **T3 sidebar order:** T3's pinned section, then its active section, including
+  positions you arrange by dragging in T3. Settled and snoozed threads do not
+  occupy keys. This follows all projects on the configured connection; T3's
+  temporary project filters and other connected environments are not mirrored.
 
-Running sessions and sessions needing input retain their current automatic slot
+Choose the mode in **Configure → Session assignments**, then **Save settings**;
+there is no need to apply the hardware mapping again. In T3 sidebar order, the
+menu and keys follow the same order, and dragging a running thread also moves its
+key on the next refresh. Micro Manager's per-key pins are ignored in this mode
+and remain saved for the other modes. New and un-settled threads move up as they
+do in T3. Snoozed threads return when T3's wake rules make them active again.
+
+In the other modes, running sessions and sessions needing input retain their current automatic slot
 as the recent list changes. An explicit pin reserves its key when the session is
 unavailable. The menu lists all sessions, including those beyond the selected
 button count. Explicit pins are stored separately for each provider and restored

@@ -341,6 +341,9 @@ public final class BridgeController: ObservableObject {
             guard isRunning, generation == epoch else { return }
             sessions = activeProvider.acknowledgementMode == .local
                 ? acknowledgements.applying(to: fetched) : fetched
+            if configuration.selection == .providerOrder {
+                sessions = SessionAssignments.orderedByProvider(sessions)
+            }
             assignments = SessionAssignments.assign(sessions, configuration: configuration, previous: assignments)
         } catch {
             guard isRunning, generation == epoch else { return }

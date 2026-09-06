@@ -9,7 +9,7 @@ connection settings, never a device handle or a physical key mapping.
 | `AgentSession` / `SessionStatus` | Common session identity, activity, completion revision and status |
 | `SessionProvider` | List and open sessions on one connection |
 | `SessionInputProvider` | Optional text insertion and advertised custom actions |
-| `SessionAssignments` | Recent, pinned and mixed selection; stable slots during work |
+| `SessionAssignments` | Recent, pinned, mixed and provider order; stable slots during work in recency modes |
 | `SessionAcknowledgements` | Local acknowledgement of a particular completed response |
 | `SessionAppearance` | Shared colours, effects and pulse speeds |
 | `BridgeController` | Polling, provider lifecycle, dispatch, layer checks and hardware lighting |
@@ -63,6 +63,13 @@ generate them from list position. Invalid snapshots fail visibly and retain the
 previous sessions as disconnected. Empty valid snapshots clear assignments.
 Normalize application states to `SessionStatus`; unfamiliar states become
 `.unknown`. Supply activity timestamps in a consistent sortable format.
+
+For app ordering, supply `AgentSession.providerOrder` as the position in the
+provider's active list and include `.providerOrder` in its available selection
+modes. A nil position excludes a session from that mode. The adapter owns the
+app's sorting and visibility rules; the bridge uses the resulting order for both
+the menu and keys, without local pins or retention of working slots. T3 supplies
+its pinned and active sidebar positions, including snooze wake rules.
 
 By default, the bridge acknowledges a `.done` session after successfully opening
 it. Supply a stable `completionID` that changes for each new completed response,

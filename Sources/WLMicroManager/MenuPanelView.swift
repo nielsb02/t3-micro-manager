@@ -93,7 +93,7 @@ struct MenuPanelView: View {
     private var sessionSection: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
-                Text(bridge.configuration.selection.title).font(.caption).foregroundStyle(.secondary)
+                Text(bridge.configuration.selection.title(for: bridge.configuration.provider)).font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Text("\(bridge.sessions.count) sessions").font(.caption).foregroundStyle(.secondary)
             }

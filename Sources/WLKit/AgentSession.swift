@@ -32,10 +32,12 @@ public struct AgentSession: Identifiable, Equatable, Sendable {
     public var directory: String?
     /// Identifies a completed response, independently of title, pin, and other metadata edits.
     public var completionID: String?
+    /// Position in the provider's active list; nil excludes it from App order mode.
+    public var providerOrder: Int?
 
     public init(id: String, title: String, status: SessionStatus, updatedAt: String = "",
                 isPinned: Bool = false, environmentID: String? = nil, directory: String? = nil,
-                completionID: String? = nil) {
+                completionID: String? = nil, providerOrder: Int? = nil) {
         self.id = id
         self.title = title
         self.status = status
@@ -44,6 +46,7 @@ public struct AgentSession: Identifiable, Equatable, Sendable {
         self.environmentID = environmentID
         self.directory = directory
         self.completionID = completionID
+        self.providerOrder = providerOrder
     }
 
     var completionRevision: String { completionID ?? updatedAt }

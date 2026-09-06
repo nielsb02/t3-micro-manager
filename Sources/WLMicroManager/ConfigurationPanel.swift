@@ -77,7 +77,10 @@ struct ConfigurationPanel: View {
         }
         .frame(minWidth: 650, minHeight: 600)
         .background(Color(nsColor: .windowBackgroundColor))
-        .onChange(of: draft.provider) { _ in testedSessions = nil; feedback = nil }
+        .onChange(of: draft.provider) { provider in
+            testedSessions = nil; feedback = nil
+            if !SessionSelectionMode.available(for: provider).contains(draft.selection) { draft.selection = .recent }
+        }
         .onChange(of: draft.t3) { _ in testedSessions = nil }
         .onChange(of: bridge.configuration) { configuration in
             if draft == baseline { draft = configuration }
@@ -308,14 +311,14 @@ struct ConfigurationPanel: View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
                 Picker("Fill selected keys with", selection: $draft.selection) {
-                    ForEach(SessionSelectionMode.allCases, id: \.self) { mode in
-                        Text(mode.title).tag(mode)
+                    ForEach(SessionSelectionMode.available(for: draft.provider), id: \.self) { mode in
+                        Text(mode.title(for: draft.provider)).tag(mode)
                     }
                 }
                 .pickerStyle(.segmented)
                 Text(selectionDescription).font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if draft.selection != .recent {
+                if draft.selection.usesExplicitPins {
                     ForEach(draft.sessionKeys, id: \.self) { key in
                         Picker("Key \(key)", selection: pinBinding(key)) {
                             Text(draft.selection == .pinned ? "Use a provider-pinned session" : "Fill automatically").tag("")
@@ -389,6 +392,8 @@ struct ConfigurationPanel: View {
             return "Fill keys with recently active sessions. Working sessions keep their current key."
         case .mixed:
             return "Keep chosen sessions on fixed keys and fill the rest with recently active sessions."
+        case .providerOrder:
+            return "Follow T3’s pinned and active sidebar order. Drag threads in T3 to rearrange your keys. Settled and snoozed threads are excluded. Uses all projects on this connection, regardless of sidebar filters."
         }
     }
 

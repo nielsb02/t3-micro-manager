@@ -64,6 +64,60 @@ final class T3ClientTests: XCTestCase {
         XCTAssertTrue(try parse([]).isEmpty)
     }
 
+    func testSidebarOrderUsesPinsManualPositionsAndCreationInsteadOfActivity() throws {
+        let sessions = try parse([
+            thread("manual-b", extra: ["activeOrderKey": "b", "latestUserMessageAt": "2026-09-07T12:00:00Z"]),
+            thread("pin-new", extra: ["pinnedAt": "yes", "createdAt": "2026-09-06T12:00:00Z"]),
+            thread("new", extra: ["createdAt": "2026-09-06T10:00:00Z"]),
+            thread("manual-a", extra: ["activeOrderKey": "a"]),
+            thread("pin-b", extra: ["pinnedAt": "yes", "pinOrderKey": "b"]),
+            thread("old", extra: ["createdAt": "2026-09-05T12:00:00Z", "latestUserMessageAt": "2026-09-08T12:00:00Z"]),
+            thread("reopened", extra: ["createdAt": "2026-09-01T12:00:00Z", "unsettledAt": "2026-09-06T11:00:00Z"]),
+            thread("pin-a", extra: ["pinnedAt": "yes", "pinOrderKey": "a"]),
+            thread("pin-old", extra: ["pinnedAt": "yes", "createdAt": "2026-09-05T12:00:00Z"]),
+            thread("settled", extra: ["settledOverride": "settled", "pinnedAt": "yes"]),
+        ])
+        XCTAssertEqual(SessionAssignments.orderedByProvider(sessions).map(\.id),
+                       ["pin-a", "pin-b", "pin-new", "pin-old", "reopened", "new", "old", "manual-a", "manual-b"])
+        XCTAssertEqual(sessions.count, 10)
+        XCTAssertNil(sessions.first { $0.id == "settled" }?.providerOrder)
+    }
+
+    func testSidebarSnoozeMatchesExpiryAndAttentionWakeRules() throws {
+        let before = "2026-09-06T10:00:00Z", snoozed = "2026-09-06T11:00:00Z", after = "2026-09-06T11:30:00Z"
+        let inputs: [[String: Any]] = [
+            thread("sleeping", session: "running"),
+            thread("expired", extra: ["snoozedUntil": before]),
+            thread("invalid-wake", extra: ["snoozedUntil": "invalid"]),
+            thread("approval", extra: ["hasPendingApprovals": true]),
+            thread("question", extra: ["hasPendingUserInput": true]),
+            thread("fresh-error", extra: ["session": ["status": "error", "updatedAt": after]]),
+            thread("old-error", extra: ["session": ["status": "error", "updatedAt": before]]),
+            thread("fresh-completion", extra: ["latestTurn": ["state": "completed", "completedAt": after]]),
+            thread("old-completion", extra: ["latestTurn": ["state": "completed", "completedAt": before]]),
+        ].map { value in
+            var result: [String: Any] = ["snoozedAt": snoozed, "snoozedUntil": "2026-09-06T14:00:00Z"]
+            result.merge(value) { _, value in value }
+            return result
+        }
+        let data = try JSONSerialization.data(withJSONObject: ["threads": inputs, "projects": []])
+        let now = ISO8601DateFormatter().date(from: "2026-09-06T12:00:00Z")!
+        let sessions = try T3Client.parseShell(data: data, environmentID: "env", now: now)
+        XCTAssertEqual(Set(SessionAssignments.orderedByProvider(sessions).map(\.id)),
+                       Set(["expired", "invalid-wake", "approval", "question", "fresh-error", "fresh-completion"]))
+    }
+
+    func testSidebarDatesUseInstantsAndDeterministicFallbacks() throws {
+        let sessions = try parse([
+            thread("newest", extra: ["createdAt": "2026-09-06T12:00:00.500Z"]),
+            thread("older-offset", extra: ["createdAt": "2026-09-06T14:00:00+02:00"]),
+            thread("b-missing"),
+            thread("a-invalid", extra: ["createdAt": "invalid"]),
+        ])
+        XCTAssertEqual(SessionAssignments.orderedByProvider(sessions).map(\.id),
+                       ["newest", "older-offset", "a-invalid", "b-missing"])
+    }
+
     func testCompletionIdentityTracksTurnsIndependentlyOfSessionMetadata() throws {
         let first = try parse([thread("thread", turn: "completed", extra: [
             "latestTurn": ["turnId": "turn-1", "state": "completed"],

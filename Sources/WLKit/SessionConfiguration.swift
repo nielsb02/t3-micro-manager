@@ -7,8 +7,22 @@ public enum SessionProviderKind: String, Codable, CaseIterable, Sendable {
 }
 
 public enum SessionSelectionMode: String, Codable, CaseIterable, Sendable {
-    case pinned, recent, mixed
-    public var title: String { switch self { case .pinned: return "Pinned"; case .recent: return "Recent"; case .mixed: return "Pinned + recent" } }
+    case pinned, recent, mixed, providerOrder
+    public var title: String {
+        switch self {
+        case .pinned: return "Pinned"
+        case .recent: return "Recent"
+        case .mixed: return "Pinned + recent"
+        case .providerOrder: return "App order"
+        }
+    }
+    public func title(for provider: SessionProviderKind) -> String {
+        self == .providerOrder && provider == .t3 ? "T3 sidebar order" : title
+    }
+    public var usesExplicitPins: Bool { self == .pinned || self == .mixed }
+    public static func available(for provider: SessionProviderKind) -> [Self] {
+        provider == .t3 ? allCases : [.pinned, .recent, .mixed]
+    }
 }
 
 public struct T3ConnectionSettings: Codable, Equatable, Sendable {
@@ -115,6 +129,9 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
         }
     }
     public func validate() throws {
+        guard SessionSelectionMode.available(for: provider).contains(selection) else {
+            throw ConfigurationError.invalid("This provider does not support app ordering.")
+        }
         guard !sessionKeys.isEmpty, Set(sessionKeys).count == sessionKeys.count,
               sessionKeys.allSatisfy({ (0...12).contains($0) }) else {
             throw ConfigurationError.invalid("Choose at least one distinct session key between 0 and 12.")
