@@ -34,6 +34,7 @@ jobs:
         run: |
           ./scripts/verify-providers.sh
           ./scripts/verify-bridge.sh
+          ./scripts/verify-desktop.sh
 
       - name: Bundle
         run: ./scripts/bundle.sh

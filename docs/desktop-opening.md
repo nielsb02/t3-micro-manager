@@ -25,6 +25,13 @@ When an app is selected, the navigation socket's owning process must match that
 app before any session request is sent. Applications shortcuts and symlinks work.
 Choosing an unpatched app does not add navigation support to it.
 
+On first launch, macOS may run a downloaded app from a temporary App Translocation
+folder. Micro Manager resolves that folder to the original selected installation.
+If the optional macOS origin lookup is unavailable, it validates both bundles and
+compares their version-specific code signature hashes. The socket must still
+belong to the matched app's process. Renaming the installed app is supported;
+select its new name in the desktop app picker.
+
 Status still uses the existing paired local HTTP connection. Browser pairing
 is unnecessary for desktop navigation. The target environment must already be
 connected in the desktop app. Unknown, archived, or disconnected targets report

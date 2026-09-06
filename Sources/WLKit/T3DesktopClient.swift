@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Darwin
 import AppKit
+import Security
 
 public enum T3DesktopError: LocalizedError {
     case unavailable, invalidPath, timeout, invalidResponse, rejected(String)
@@ -62,13 +63,61 @@ public enum T3DesktopClient {
         return url
     }
 
+    static func matchesApplication(_ runningURL: URL?, selected: URL) async -> Bool {
+        guard let running = runningURL?.resolvingSymlinksInPath().standardizedFileURL else { return false }
+        let selected = selected.resolvingSymlinksInPath().standardizedFileURL
+        if running.path == selected.path { return true }
+
+        // Gatekeeper can run the selected app from a randomized read-only copy.
+        // Only that relocation may match by its exact signed build instead of path.
+        let components = running.pathComponents
+        guard let index = components.firstIndex(of: "AppTranslocation"),
+              components.count == index + 4,
+              UUID(uuidString: components[index + 1]) != nil,
+              components[index + 2] == "d" else { return false }
+        return await Task.detached {
+            if let original = translocationOrigin(of: running), original.path != running.path {
+                return original.path == selected.path
+            }
+            guard let selectedIdentity = validatedCodeIdentity(at: selected),
+                  let runningIdentity = validatedCodeIdentity(at: running) else { return false }
+            return selectedIdentity == runningIdentity
+        }.value
+    }
+
+    private static func translocationOrigin(of url: URL) -> URL? {
+        // This Security SPI resolves the real mount origin without changing Gatekeeper.
+        // Load it optionally; exact signature validation remains the fallback.
+        guard let library = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY | RTLD_LOCAL) else { return nil }
+        defer { dlclose(library) }
+        guard let symbol = dlsym(library, "SecTranslocateCreateOriginalPathForURL") else { return nil }
+        typealias Resolve = @convention(c) (CFURL, UnsafeMutablePointer<Unmanaged<CFError>?>?) -> Unmanaged<CFURL>?
+        let resolve = unsafeBitCast(symbol, to: Resolve.self)
+        guard let original = resolve(url as CFURL, nil)?.takeRetainedValue() else { return nil }
+        return (original as URL).resolvingSymlinksInPath().standardizedFileURL
+    }
+
+    private static func validatedCodeIdentity(at url: URL) -> Data? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &code) == errSecSuccess,
+              let code,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate | kSecCSCheckNestedCode), nil) == errSecSuccess
+        else { return nil }
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(), &information) == errSecSuccess,
+              let values = information as? [String: Any] else { return nil }
+        return values[kSecCodeInfoUnique as String] as? Data
+    }
+
     @MainActor static func prepareApplication(path: String) async throws -> (processID: pid_t?, launched: Bool) {
         guard !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return (nil, false) }
         let selected = try applicationURL(path: path)
         guard let identifier = Bundle(url: selected)?.bundleIdentifier else { throw T3DesktopError.invalidApplication }
         let running = NSRunningApplication.runningApplications(withBundleIdentifier: identifier).filter { !$0.isTerminated }
-        if let application = running.first(where: { $0.bundleURL?.resolvingSymlinksInPath().standardizedFileURL.path == selected.path }) {
-            return (application.processIdentifier, false)
+        for application in running {
+            if await matchesApplication(application.bundleURL, selected: selected), !application.isTerminated {
+                return (application.processIdentifier, false)
+            }
         }
         if let other = running.first {
             throw T3DesktopError.differentApplicationRunning(other.bundleURL?.path ?? identifier)
@@ -83,7 +132,7 @@ public enum T3DesktopClient {
                 else { continuation.resume(throwing: T3DesktopError.invalidApplication) }
             }
         }
-        guard application.url?.resolvingSymlinksInPath().standardizedFileURL.path == selected.path else {
+        guard await matchesApplication(application.url, selected: selected) else {
             throw T3DesktopError.differentApplicationRunning(application.url?.path ?? identifier)
         }
         return (application.processID, true)

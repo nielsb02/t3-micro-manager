@@ -143,7 +143,8 @@ public enum T3Error: LocalizedError {
     private func request(path: String, authenticated: Bool = true, body: Data? = nil,
                          contentType: String? = nil) async throws -> Data {
         let url = try baseURL().appendingPathComponent(String(path.dropFirst()))
-        var request = URLRequest(url: url)
+        // Session status is live state; cached shell snapshots can leave LEDs stale.
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if authenticated && !settings.bearerToken.isEmpty {
             request.setValue("Bearer \(settings.bearerToken)", forHTTPHeaderField: "Authorization")

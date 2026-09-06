@@ -32,6 +32,27 @@ import Darwin
         try FileManager.default.createSymbolicLink(atPath: alias, withDestinationPath: app.path)
         let resolved = try T3DesktopClient.applicationURL(path: alias)
         precondition(resolved == app.resolvingSymlinksInPath())
+        let resources = app.appendingPathComponent("Contents/Resources")
+        try FileManager.default.createDirectory(at: resources, withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: resources.appendingPathComponent("fixture.txt"))
+        try sign(app)
+        let translocated = URL(fileURLWithPath: root)
+            .appendingPathComponent("AppTranslocation/\(UUID().uuidString)/d/Fixture.app")
+        try FileManager.default.createDirectory(at: translocated.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.copyItem(at: app, to: translocated)
+        let matchingCopy = await T3DesktopClient.matchesApplication(translocated, selected: app)
+        precondition(matchingCopy, "Rejected the same signed app relocated by Gatekeeper")
+        let ordinaryCopy = URL(fileURLWithPath: root + "/Other.app")
+        try FileManager.default.copyItem(at: app, to: ordinaryCopy)
+        let differentInstall = await T3DesktopClient.matchesApplication(ordinaryCopy, selected: app)
+        precondition(!differentInstall, "Accepted a different installation outside App Translocation")
+        try Data("modified".utf8).write(to: translocated.appendingPathComponent("Contents/Resources/fixture.txt"))
+        let tamperedCopy = await T3DesktopClient.matchesApplication(translocated, selected: app)
+        precondition(!tamperedCopy, "Accepted a damaged signature")
+        try sign(translocated)
+        let differentBuild = await T3DesktopClient.matchesApplication(translocated, selected: app)
+        precondition(!differentBuild, "Accepted another signed build with the same bundle ID")
+        print("PASS: Gatekeeper relocation accepts only the same verified build; different installations, tampering and other builds are rejected")
         let automatic = try await T3DesktopClient.prepareApplication(path: "")
         precondition(automatic.processID == nil && !automatic.launched)
 
@@ -87,5 +108,15 @@ import Darwin
         settings.desktopApplicationPath = alias
         try await T3DesktopClient.openThread(session, settings: settings)
         print("PASS: launched a selected app through NSWorkspace, waited for its socket, verified the owning process and opened the exact session")
+    }
+
+    private static func sign(_ app: URL) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
+        process.arguments = ["--force", "--sign", "-", app.path]
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        precondition(process.terminationStatus == 0, "Could not sign the disposable fixture")
     }
 }

@@ -154,6 +154,56 @@ final class T3ClientTests: XCTestCase {
         XCTAssertEqual(discoveryCount, 1)
     }
 
+    @MainActor func testPollingReadsNewStatusDespiteCacheableResponses() async throws {
+        let server = Process()
+        server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        server.arguments = ["-u", "-c", """
+        import json
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        class Handler(BaseHTTPRequestHandler):
+            count = 0
+            def do_GET(self):
+                Handler.count += 1
+                working = Handler.count == 1
+                body = json.dumps({"projects": [], "threads": [{
+                    "id": "session", "projectId": "project", "title": "Live status",
+                    "updatedAt": "2026-09-06T12:00:00Z",
+                    "session": {"status": "running" if working else "ready"},
+                    "latestTurn": {"state": "running" if working else "completed"},
+                    "hasPendingApprovals": False, "hasPendingUserInput": False
+                }]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "max-age=3600")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args): pass
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        print(server.server_port, flush=True)
+        server.serve_forever()
+        """]
+        let output = Pipe()
+        server.standardOutput = output
+        try server.run()
+        defer { if server.isRunning { server.terminate() }; server.waitUntilExit() }
+        var portData = Data()
+        while let byte = try output.fileHandleForReading.read(upToCount: 1), !byte.isEmpty, byte != Data([10]) {
+            portData.append(byte)
+        }
+        guard let portText = String(data: portData, encoding: .utf8), let port = Int(portText) else {
+            XCTFail("Cache fixture did not start"); return
+        }
+        var settings = T3ConnectionSettings()
+        settings.baseURL = "http://127.0.0.1:\(port)"
+        settings.environmentID = "env"
+        let client = T3Client(settings: settings)
+        let first = try await client.listSessions()
+        let second = try await client.listSessions()
+        XCTAssertEqual(first.first?.status, .working)
+        XCTAssertEqual(second.first?.status, .done)
+    }
+
     @MainActor func testAuthorizationFailureDoesNotExposeResponseBody() async throws {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [T3TestURLProtocol.self]
