@@ -146,6 +146,7 @@ import Foundation
         check(cancelled && delivered == actions + [.dialCounterclockwise])
         print("PASS: mixed rotations/presses retain order; cancellation drops queued and in-flight work")
 
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let bridge = BridgeController(providerFactory: { _ in DemoSessionProvider() })
         await bridge.startDemo()
         var controlConfiguration = bridge.configuration
@@ -250,7 +251,7 @@ import Foundation
         check(MicroControlMapping.fixedActions == [.dialClockwise, .dialCounterclockwise, .dialPress, .composerToggle])
         check(T3MicroAction.assignableActions == [.newThread, .newProject, .composerToggle, .latestMessage,
                                                  .settleThread, .terminalToggle, .commandPalette])
-        var configuration = SessionConfiguration()
+        var configuration = SessionConfiguration(reserveCodexSlots: true)
         configuration.actionButtons = [6: .settleThread, 7: .newThread]
         try configuration.validate()
         check(try JSONDecoder().decode(SessionConfiguration.self, from: JSONEncoder().encode(configuration)) == configuration)

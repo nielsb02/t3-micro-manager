@@ -68,7 +68,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func lifetimeAndAcknowledgements() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let provider = FixtureProvider()
         var constructions = 0
         let bridge = BridgeController(providerFactory: { _ in constructions += 1; return provider })
@@ -119,7 +119,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func previewConnectionReuse() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         var instances: [FixtureProvider] = []
         let bridge = BridgeController(providerFactory: { _ in
             let provider = FixtureProvider()
@@ -141,7 +141,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func providerOrdering() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let provider = FixtureProvider()
         provider.snapshot = [
             AgentSession(id: "a", title: "A", status: .working, providerOrder: 1),
@@ -171,7 +171,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func nativeAcknowledgements() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let provider = FixtureProvider()
         provider.acknowledgementMode = .provider
         let bridge = BridgeController(providerFactory: { _ in provider })
@@ -185,7 +185,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func optionalInputs() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let provider = InputFixtureProvider()
         let readOnly = FixtureProvider()
         let bridge = BridgeController(providerFactory: { $0.provider == .herdr ? readOnly : provider })
@@ -216,7 +216,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func lateOpen(fails: Bool) async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let old = FixtureProvider(), next = FixtureProvider()
         let bridge = BridgeController(providerFactory: { $0.provider == .herdr ? next : old })
         await bridge.startDemo()
@@ -238,7 +238,7 @@ enum FixtureFailure: Error { case offline }
     }
 
     @MainActor static func stopDrainsRefresh() async throws {
-        try SessionConfiguration().save()
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let old = FixtureProvider(), next = FixtureProvider()
         next.snapshot[0].title = "New provider"
         let bridge = BridgeController(providerFactory: { $0.provider == .herdr ? next : old })

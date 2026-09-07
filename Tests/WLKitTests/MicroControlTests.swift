@@ -33,7 +33,8 @@ final class MicroControlTests: XCTestCase {
         XCTAssertThrowsError(try enabled.validate())
         enabled.sessionKeys = [0]
         enabled.provider = .herdr
-        XCTAssertThrowsError(try enabled.validate())
+        try enabled.validate()
+        XCTAssertFalse(enabled.activeMicroControlsEnabled)
         enabled.provider = .t3
         enabled.t3.openTarget = .browser
         XCTAssertThrowsError(try enabled.validate())
@@ -226,7 +227,7 @@ final class MicroControlTests: XCTestCase {
     }
 
     func testActionAssignmentsPersistAndRejectSessionOverlapOrExhaustedSlots() throws {
-        var configuration = SessionConfiguration()
+        var configuration = SessionConfiguration(reserveCodexSlots: true)
         configuration.actionButtons = [6: .settleThread, 7: .newThread]
         try configuration.validate()
         XCTAssertEqual(try JSONDecoder().decode(SessionConfiguration.self, from: JSONEncoder().encode(configuration)), configuration)
@@ -249,7 +250,7 @@ final class MicroControlTests: XCTestCase {
     }
 
     func testActionButtonsReserveSlotsAndRestoreWithoutChangingUnassignedBindings() throws {
-        var configuration = SessionConfiguration()
+        var configuration = SessionConfiguration(reserveCodexSlots: true)
         configuration.actionButtons = [6: .settleThread, 7: .newThread]
         configuration.microControlsEnabled = true
         let original = PadEmulator.stockKeymap()
@@ -279,7 +280,7 @@ final class MicroControlTests: XCTestCase {
     }
 
     func testActionButtonsWorkWithoutOptingIntoTheDialAndCanBeRemovedReversibly() throws {
-        var configuration = SessionConfiguration()
+        var configuration = SessionConfiguration(reserveCodexSlots: true)
         configuration.actionButtons = [6: .settleThread]
         let stock = PadEmulator.stockKeymap()
         let backup = try LayerMapping.capture(config: stock, target: target, keys: configuration.assignedButtonKeys)

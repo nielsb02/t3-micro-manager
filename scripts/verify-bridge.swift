@@ -34,7 +34,7 @@ import Foundation
         }
         precondition(ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]?.contains("micro-verify") == true,
                      "Run through scripts/verify-bridge.sh to isolate configuration.")
-        var cfg = SessionConfiguration()
+        var cfg = SessionConfiguration(reserveCodexSlots: true)
         cfg.sessionKeys = [1, 0]
         let sessions = [
             AgentSession(id: "active", title: "Active", status: .working, updatedAt: "1"),
