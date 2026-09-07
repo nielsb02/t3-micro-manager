@@ -1,0 +1,840 @@
+diff --git a/README.md b/README.md
+index d342e73..5c49f62 100644
+--- a/README.md
++++ b/README.md
+@@ -103,6 +103,42 @@ The default prints a `codex fork` command; `--resume` prints a `codex resume`
+ command. The current process cannot migrate its already loaded instruction
+ root merely by changing directory.
+ 
++Shut down the current composite workspace's repository-owned runtimes with:
++
++```bash
++./bin/guestspace workspace shutdown --json
++```
++
++The command calls each bound repository's `runtime.shutdown` capability and
++keeps Git worktrees, branches, and uncommitted source files. Repository hooks
++own removal of task runtime resources, including any task databases, object
++storage, and cache data covered by their shutdown contract. Every binding must
++be a registered, exclusively claimed managed worktree inside this initialized
++composite workspace. Primary clones, attached or shared worktrees, and
++mismatched workspace identities are refused before any shutdown runs.
++
++An updated primary CLI can also target an older composite checkout explicitly:
++
++```bash
++./bin/guestspace workspace shutdown /path/to/task/workspace --json
++```
++
++JSON output includes the workspace/task identity and each repository's result.
++Exit status is zero only when all shutdowns succeed; a repository failure is
++reported while the remaining validated repositories are still attempted.
++An initialized workspace with no repository bindings succeeds without runtime
++calls. Repository hooks determine whether an uninitialized or already-stopped
++runtime is safe to skip; unsupported or uncertain results remain failures.
++Task completion and source-worktree cleanup use their separate lifecycle commands.
++
++In the matching T3 build with manual thread settlement actions, open this primary
++workspace project's actions and choose **From t3.json** to import **Shut down
++workspace runtimes**. The checked-in file does not enable the action until you
++import it. Once imported, manually settling a thread invokes the primary CLI for
++that thread's composite workspace. This removes the repository-owned runtime data
++described above and preserves Git worktrees and source files. It does not run when
++creating a worktree or when a thread settles automatically.
++
+ Scan registry and Git worktree state periodically:
+ 
+ ```bash
+diff --git a/docs/architecture.md b/docs/architecture.md
+index a0b00f7..60b02da 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -114,6 +114,17 @@ containers, or provision databases. Heavy initialization remains lazy. If the
+ repository does not advertise `worktree.prepare`, creation still succeeds and
+ the unsupported capability is retained as a task limitation.
+ 
++`workspace shutdown [path]` delegates `runtime.shutdown` to every bound
++repository while preserving the composite and application Git worktrees.
++The optional path lets the updated primary CLI serve an older task checkout.
++Before dispatch, the coordinator verifies the linked outer Git checkout,
++`.guestspace/workspace.json`, canonical task registration, configured repository
++identity, exact managed project paths, exclusive claims, and task-owned Git
++locks and branches. A changed binding is rejected again at the capability
++execution boundary. Runtime commands retain repository ownership and existing
++capability evidence recording. Failures are collected per repository and
++produce a nonzero command result.
++
+ ## Ownership and orchestration contract
+ 
+ Each application repository owns its internal commands, dependencies, and
+diff --git a/src/guestspace_harness/cli.py b/src/guestspace_harness/cli.py
+index 9b0fe36..0bb2ae3 100644
+--- a/src/guestspace_harness/cli.py
++++ b/src/guestspace_harness/cli.py
+@@ -221,6 +221,14 @@ def build_parser() -> argparse.ArgumentParser:
+     workspace_add.add_argument("--json", action="store_true")
+     workspace_path = workspace_commands.add_parser("path")
+     workspace_path.add_argument("--json", action="store_true")
++    workspace_shutdown = workspace_commands.add_parser(
++        "shutdown",
++        help="Shut down repository-owned task runtimes while preserving source worktrees",
++    )
++    workspace_shutdown.add_argument(
++        "path", nargs="?", help="Initialized linked workspace path; defaults to this workspace"
++    )
++    workspace_shutdown.add_argument("--json", action="store_true")
+     workspace_continue = workspace_commands.add_parser("continue")
+     workspace_continue.add_argument("session_id")
+     workspace_continue.add_argument("--resume", action="store_true")
+@@ -400,6 +408,11 @@ def _main(
+                 args.objective,
+                 task_id=args.task_id,
+             ).to_dict()
++        elif args.workspace_command == "shutdown":
++            result = composites.shutdown(
++                Path(args.path) if args.path else invocation_root,
++                environment=os.environ,
++            ).to_dict()
+         elif args.workspace_command == "add":
+             identity = composites.identity(invocation_root)
+             if identity is None:
+@@ -446,6 +459,16 @@ def _main(
+             }
+         if args.json:
+             print(json.dumps(result, sort_keys=True), file=output)
++        elif args.workspace_command == "shutdown":
++            print(f"{result['status']}: workspace.shutdown", file=output)
++            if reason := result["details"].get("reason"):
++                print(reason, file=output)
++            for item in result["details"].get("repositories", []):
++                detail = item["details"]
++                diagnostic = item.get("error_code") or "runtime.shutdown"
++                if reason := detail.get("reason"):
++                    diagnostic += f": {reason}"
++                print(f"  {detail['repository_id']}: {item['status']} ({diagnostic})", file=output)
+         elif args.workspace_command == "continue":
+             print(shlex.join(result["details"]["command"]), file=output)
+         elif "workspace_path" in result["details"]:
+diff --git a/src/guestspace_harness/composite.py b/src/guestspace_harness/composite.py
+index b2305a1..69a30a4 100644
+--- a/src/guestspace_harness/composite.py
++++ b/src/guestspace_harness/composite.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ import json
+ import re
+ import secrets
++from collections.abc import Mapping
+ from dataclasses import dataclass
+ from datetime import date
+ from pathlib import Path
+@@ -10,10 +11,11 @@ from pathlib import Path
+ from .git import GitClient, GitFailure
+ from .manifest import WorkspaceManifest
+ from .storage import atomic_write
+-from .task_model import OperationResult, OperationStatus, TaskError
++from .task_model import Binding, OperationResult, OperationStatus, Ownership, Task, TaskError
+ from .task_store import TaskStore
+ from .tasks import TaskCoordinator
+ from .workspace_paths import WorkspacePathError, resolve_workspace_checkout
++from .worktrees import WorktreeManager, parse_worktree_porcelain
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+@@ -254,6 +256,149 @@ class CompositeWorkspaceCoordinator:
+             return self._workspace_add_result(confirmed)
+         return self._create_and_prepare_repository(task_id, repository_id)
+ 
++    def shutdown(
++        self,
++        workspace_path: Path,
++        *,
++        environment: Mapping[str, str] | None = None,
++    ) -> OperationResult:
++        outer = workspace_path.resolve()
++        try:
++            task = self._shutdown_task(outer)
++            claims = self.store.load_claims()
++        except (TaskError, GitFailure, WorkspacePathError, OSError) as error:
++            return OperationResult(
++                "workspace.shutdown",
++                OperationStatus.CONFLICT,
++                error_code="unsafe_workspace",
++                details={"workspace_path": str(outer), "reason": str(error)},
++            )
++
++        failures = []
++        for binding in task.bindings:
++            try:
++                self._validate_shutdown_binding(task, binding, outer, claims)
++            except (TaskError, GitFailure, OSError) as error:
++                failures.append(
++                    OperationResult(
++                        "runtime.shutdown",
++                        OperationStatus.CONFLICT,
++                        task.id,
++                        "unsafe_repository_binding",
++                        {"repository_id": binding.repository_id, "reason": str(error)},
++                    ).to_dict()
++                )
++        if failures:
++            return OperationResult(
++                "workspace.shutdown",
++                OperationStatus.CONFLICT,
++                task.id,
++                "unsafe_repository_binding",
++                {"workspace_path": str(outer), "repositories": failures},
++            )
++
++        results = []
++        for binding in task.bindings:
++            try:
++                if self._shutdown_task(outer).id != task.id:
++                    raise TaskError("workspace registration changed during shutdown")
++                self._validate_shutdown_binding(task, binding, outer, self.store.load_claims())
++                result = self.tasks.run_capability(
++                    task.id,
++                    binding.repository_id,
++                    "runtime.shutdown",
++                    environment=environment,
++                    expected_binding=binding,
++                )
++                if not isinstance(result, OperationResult):
++                    raise TaskError("runtime.shutdown did not return an operation result")
++            except (TaskError, GitFailure, WorkspacePathError, OSError) as error:
++                result = OperationResult(
++                    "runtime.shutdown",
++                    OperationStatus.FAILED,
++                    task.id,
++                    "shutdown_failed",
++                    {"reason": str(error)},
++                )
++            item = result.to_dict()
++            item["details"] = {**result.details, "repository_id": binding.repository_id}
++            results.append(item)
++        failed = any(item["status"] != OperationStatus.OK.value for item in results)
++        return OperationResult(
++            "workspace.shutdown",
++            OperationStatus.FAILED if failed else OperationStatus.OK,
++            task.id,
++            "repository_shutdown_failed" if failed else None,
++            {"workspace_path": str(outer), "repositories": results},
++        )
++
++    def _shutdown_task(self, outer: Path) -> Task:
++        if not self.git.is_worktree_root(outer):
++            raise TaskError("shutdown requires the root of a linked composite workspace")
++        checkout = resolve_workspace_checkout(outer, self.git)
++        if not checkout.is_linked or checkout.primary_root != self.manifest.root.resolve():
++            raise TaskError("shutdown requires a linked checkout of this primary workspace")
++        records = parse_worktree_porcelain(self.git.worktree_porcelain(self.manifest.root))
++        if not any(
++            record.path.resolve() == outer and not record.bare and not record.prunable
++            for record in records
++        ):
++            raise TaskError("workspace is not a registered linked worktree")
++        if (
++            self._has_symlinked_local_state(outer)
++            or (outer / ".guestspace" / "workspace.json").is_symlink()
++        ):
++            raise TaskError("shutdown refuses symlinked workspace state")
++        identity = self.identity(outer)
++        if identity is None:
++            raise TaskError("workspace is not initialized; workspace.json is required")
++        task = self.store.task_for_workspace(outer)
++        if task is None or task.id != identity.task_id:
++            raise TaskError("workspace identity does not match its canonical task record")
++        return task
++
++    def _validate_shutdown_binding(
++        self,
++        task: Task,
++        binding: Binding,
++        outer: Path,
++        claims: tuple[dict[str, object], ...],
++    ) -> None:
++        repository = next(
++            (item for item in self.manifest.repositories if item.id == binding.repository_id),
++            None,
++        )
++        if repository is None or binding.ownership is not Ownership.MANAGED:
++            raise TaskError("shutdown requires a configured, managed repository binding")
++        expected = outer / "projects" / binding.repository_id
++        if (
++            binding.worktree_path != str(expected)
++            or expected.resolve() != expected
++            or not self.git.is_worktree_root(expected)
++        ):
++            raise TaskError("bound worktree must be at this workspace's projects/<repository-id>")
++        owners = [item for item in claims if item["canonical_path"] == str(expected)]
++        if len(owners) != 1 or any(
++            owner["task_id"] != task.id
++            or owner["repository_id"] != binding.repository_id
++            or owner["ownership"] != Ownership.MANAGED.value
++            for owner in owners
++        ):
++            raise TaskError("bound worktree lacks an exclusive managed claim for this task")
++        manager = WorktreeManager(
++            self.git,
++            repository.target_path(self.manifest.workspace.projects_path),
++            repository.github,
++        )
++        record = manager.eligible_attachment(expected)
++        if (
++            not record.locked
++            or record.lock_reason != task.id
++            or record.branch != binding.branch
++            or record.prunable
++        ):
++            raise TaskError("bound worktree branch or Git lock does not match its task")
++
+     def _create_and_prepare_repository(
+         self,
+         task_id: str,
+diff --git a/src/guestspace_harness/tasks.py b/src/guestspace_harness/tasks.py
+index 8652965..5f62242 100644
+--- a/src/guestspace_harness/tasks.py
++++ b/src/guestspace_harness/tasks.py
+@@ -617,8 +617,13 @@ class TaskCoordinator:
+         inputs: Mapping[str, str] | None = None,
+         environment: Mapping[str, str] | None = None,
+         trigger_links: bool = True,
++        expected_binding: Binding | None = None,
+     ) -> OperationResult:
+         binding = self._binding(task_id, repository_id)
++        if expected_binding is not None and binding != expected_binding:
++            return OperationResult(
++                capability, OperationStatus.CONFLICT, task_id, "binding_changed"
++            )
+         if binding is None or binding.worktree_path is None:
+             return OperationResult(
+                 capability, OperationStatus.CONFLICT, task_id, "worktree_required"
+diff --git a/t3.json b/t3.json
+new file mode 100644
+index 0000000..3c12959
+--- /dev/null
++++ b/t3.json
+@@ -0,0 +1,11 @@
++{
++  "scripts": [
++    {
++      "name": "Shut down workspace runtimes",
++      "command": "\"$T3CODE_PROJECT_ROOT/bin/guestspace\" workspace shutdown \"$T3CODE_WORKTREE_PATH\" --json",
++      "icon": "configure",
++      "runOnWorktreeCreate": false,
++      "runOnThreadSettle": true
++    }
++  ]
++}
+diff --git a/tests/test_workspace_shutdown.py b/tests/test_workspace_shutdown.py
+new file mode 100644
+index 0000000..61e11c2
+--- /dev/null
++++ b/tests/test_workspace_shutdown.py
+@@ -0,0 +1,359 @@
++from __future__ import annotations
++
++import io
++import json
++import os
++import subprocess
++from dataclasses import replace
++from pathlib import Path
++
++import pytest
++import yaml
++from workspace_shutdown_fixture import create_shutdown_fixture, git
++
++from guestspace_harness.cli import build_parser, main
++from guestspace_harness.task_model import OperationStatus, Ownership
++
++
++def test_shutdown_delegates_all_repositories_and_preserves_dirty_source_and_worktrees(
++    tmp_path: Path,
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    before = git(coordinator.manifest.root, "worktree", "list", "--porcelain")
++    source = outer / "projects/backend/source.txt"
++    source.write_text("valuable uncommitted work\n")
++    before_repositories = {
++        name: git(outer / "projects" / name, "status", "--porcelain")
++        for name in ("backend", "frontend")
++    }
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.OK
++    assert runner.calls == [outer / "projects/backend", outer / "projects/frontend"]
++    assert source.read_text() == "valuable uncommitted work\n"
++    assert git(coordinator.manifest.root, "worktree", "list", "--porcelain") == before
++    for name in ("backend", "frontend"):
++        assert git(outer / "projects" / name, "status", "--porcelain") == before_repositories[name]
++        assert (outer / "projects" / name / ".git").is_file()
++    lock = coordinator.store.load_lock(result.task_id)
++    assert lock.observed["runtime_states"] == {"backend": "stopped", "frontend": "stopped"}
++    assert coordinator.shutdown(outer).status is OperationStatus.OK
++
++
++def test_shutdown_continues_after_repository_failure_and_reports_each_result(
++    tmp_path: Path,
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    runner.failures.add("backend")
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.FAILED
++    assert result.error_code == "repository_shutdown_failed"
++    assert len(runner.calls) == 2
++    assert [item["status"] for item in result.details["repositories"]] == ["failed", "ok"]
++    failed = result.details["repositories"][0]
++    assert failed["details"]["repository_id"] == "backend"
++    assert failed["error_code"] == "command_failed"
++    assert Path(failed["details"]["evidence_path"]).is_file()
++
++
++def test_shutdown_reports_unsupported_or_uncertain_runtime_instead_of_claiming_success(
++    tmp_path: Path,
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    descriptor = outer / "projects/backend/.guestspace/project.yaml"
++    raw = yaml.safe_load(descriptor.read_text())
++    del raw["capabilities"]["runtime.shutdown"]
++    descriptor.write_text(yaml.safe_dump(raw))
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.FAILED
++    assert result.details["repositories"][0]["status"] == "unsupported"
++    assert runner.calls == [outer / "projects/frontend"]
++
++
++@pytest.mark.parametrize(
++    "target",
++    [
++        "primary",
++        "uninitialized",
++        "marker-mismatch",
++        "subdirectory",
++        "symlink-marker",
++        "unregistered",
++    ],
++)
++def test_shutdown_refuses_unsafe_outer_workspace_without_runtime_calls(
++    tmp_path: Path, target: str
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    if target == "primary":
++        outer = coordinator.manifest.root
++    elif target == "uninitialized":
++        (outer / ".guestspace/workspace.json").unlink()
++    elif target == "marker-mismatch":
++        marker = outer / ".guestspace/workspace.json"
++        identity = json.loads(marker.read_text())
++        identity["task_id"] = "20260907-different-task-abc123"
++        marker.write_text(json.dumps(identity))
++    elif target == "symlink-marker":
++        marker = outer / ".guestspace/workspace.json"
++        moved = outer / "marker-copy.json"
++        marker.rename(moved)
++        marker.symlink_to(moved)
++    elif target == "unregistered":
++        task = coordinator.store.task_for_workspace(outer)
++        (coordinator.store.task_path(task.id) / "workspace.yaml").unlink()
++    else:
++        outer = outer / "config"
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.CONFLICT
++    assert result.error_code == "unsafe_workspace"
++    assert runner.calls == []
++
++
++@pytest.mark.parametrize(
++    "unsafe",
++    ["attached", "outside", "primary", "missing-claim", "shared", "branch", "lock", "origin"],
++)
++def test_shutdown_preflights_all_bindings_before_any_runtime_call(
++    tmp_path: Path, unsafe: str
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    task = coordinator.store.task_for_workspace(outer)
++    binding = task.bindings[1]
++    path = Path(binding.worktree_path)
++    if unsafe in {"attached", "outside", "primary"}:
++        changed = replace(
++            binding,
++            ownership=Ownership.ATTACHED if unsafe == "attached" else binding.ownership,
++            worktree_path=(
++                str(tmp_path / "external")
++                if unsafe == "outside"
++                else str(coordinator.manifest.root / "projects/frontend")
++                if unsafe == "primary"
++                else binding.worktree_path
++            ),
++        )
++        lock = coordinator.store.load_lock(task.id)
++        coordinator.store.mutate(
++            task.id,
++            lock.revision,
++            lambda task, lock: (
++                replace(task, bindings=(task.bindings[0], changed)),
++                replace(lock, revision=lock.revision + 1),
++            ),
++        )
++    elif unsafe in {"missing-claim", "shared"}:
++        coordinator.store.release_worktree(task.id, binding.repository_id, path)
++        if unsafe == "shared":
++            coordinator.store.claim_worktree(
++                "20260907-other-task-abc123", binding.repository_id, path
++            )
++    elif unsafe == "branch":
++        git(path, "checkout", "-b", "other-branch")
++    elif unsafe == "lock":
++        git(path, "worktree", "unlock", str(path))
++    else:
++        git(path, "remote", "set-url", "origin", "git@github.com:other/project.git")
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.CONFLICT
++    assert result.error_code == "unsafe_repository_binding"
++    assert runner.calls == []
++    assert result.details["repositories"][-1]["details"]["repository_id"] == "frontend"
++
++
++def test_shutdown_empty_initialized_workspace_is_a_successful_noop(tmp_path: Path) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    task = coordinator.store.task_for_workspace(outer)
++    lock = coordinator.store.load_lock(task.id)
++    coordinator.store.mutate(
++        task.id,
++        lock.revision,
++        lambda task, lock: (replace(task, bindings=()), replace(lock, revision=lock.revision + 1)),
++    )
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.OK
++    assert result.details["repositories"] == []
++    assert runner.calls == []
++
++
++def test_shutdown_cli_supports_explicit_path_and_reports_json_failure(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    runner.failures.add("backend")
++    monkeypatch.setattr(
++        "guestspace_harness.cli.TaskCoordinator", lambda *_args, **_kw: coordinator.tasks
++    )
++    stdout = io.StringIO()
++
++    code = main(
++        ["workspace", "shutdown", str(outer), "--json"],
++        repository_root=coordinator.manifest.root,
++        stdout=stdout,
++        stderr=io.StringIO(),
++    )
++
++    assert code == 1
++    result = json.loads(stdout.getvalue())
++    assert result["operation"] == "workspace.shutdown"
++    assert result["details"]["workspace_path"] == str(outer)
++    assert [item["status"] for item in result["details"]["repositories"]] == ["failed", "ok"]
++    assert len(runner.calls) == 2
++
++
++def test_shutdown_cli_defaults_to_invocation_workspace_and_reports_each_repository(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    monkeypatch.setattr(
++        "guestspace_harness.cli.TaskCoordinator", lambda *_args, **_kw: coordinator.tasks
++    )
++    stdout = io.StringIO()
++
++    code = main(["workspace", "shutdown"], repository_root=outer, stdout=stdout)
++
++    assert code == 0
++    assert "backend: ok" in stdout.getvalue()
++    assert "frontend: ok" in stdout.getvalue()
++    assert len(runner.calls) == 2
++    args = build_parser().parse_args(["workspace", "shutdown", str(outer), "--json"])
++    assert args.path == str(outer)
++
++
++def test_shutdown_cli_primary_refusal_is_json_and_nonzero(tmp_path: Path) -> None:
++    coordinator, _outer, runner = create_shutdown_fixture(tmp_path)
++    stdout = io.StringIO()
++
++    code = main(
++        ["workspace", "shutdown", "--json"],
++        repository_root=coordinator.manifest.root,
++        stdout=stdout,
++    )
++
++    assert code == 1
++    assert json.loads(stdout.getvalue())["error_code"] == "unsafe_workspace"
++    assert runner.calls == []
++
++
++def test_shutdown_rejects_binding_changed_after_preflight(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    run_capability = coordinator.tasks.run_capability
++
++    def change_binding(task_id, repository_id, capability, **kwargs):
++        if repository_id == "backend":
++            lock = coordinator.store.load_lock(task_id)
++            coordinator.store.mutate(
++                task_id,
++                lock.revision,
++                lambda task, lock: (
++                    replace(
++                        task,
++                        bindings=(
++                            replace(
++                                task.bindings[0],
++                                worktree_path=str(coordinator.manifest.root / "projects/backend"),
++                            ),
++                            task.bindings[1],
++                        ),
++                    ),
++                    replace(lock, revision=lock.revision + 1),
++                ),
++            )
++        return run_capability(task_id, repository_id, capability, **kwargs)
++
++    monkeypatch.setattr(coordinator.tasks, "run_capability", change_binding)
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.FAILED
++    assert result.details["repositories"][0]["error_code"] == "binding_changed"
++    assert runner.calls == [outer / "projects/frontend"]
++
++
++def test_shutdown_handles_uncertain_capability_result_without_skipping_other_repositories(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    original = coordinator.tasks.run_capability
++
++    def uncertain(task_id, repository_id, capability, **kwargs):
++        if repository_id == "backend":
++            return False
++        return original(task_id, repository_id, capability, **kwargs)
++
++    monkeypatch.setattr(coordinator.tasks, "run_capability", uncertain)
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.FAILED
++    assert result.details["repositories"][0]["error_code"] == "shutdown_failed"
++    assert runner.calls == [outer / "projects/frontend"]
++
++
++def test_shutdown_rechecks_claims_after_an_earlier_repository_finishes(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    coordinator, outer, runner = create_shutdown_fixture(tmp_path)
++    original = coordinator.tasks.run_capability
++
++    def release_next_claim(task_id, repository_id, capability, **kwargs):
++        result = original(task_id, repository_id, capability, **kwargs)
++        if repository_id == "backend":
++            next_path = outer / "projects/frontend"
++            coordinator.store.release_worktree(task_id, "frontend", next_path)
++            coordinator.store.claim_worktree("20260907-other-task-abc123", "frontend", next_path)
++        return result
++
++    monkeypatch.setattr(coordinator.tasks, "run_capability", release_next_claim)
++
++    result = coordinator.shutdown(outer)
++
++    assert result.status is OperationStatus.FAILED
++    assert result.details["repositories"][0]["status"] == "ok"
++    assert "exclusive managed claim" in result.details["repositories"][1]["details"]["reason"]
++    assert runner.calls == [outer / "projects/backend"]
++
++
++def test_actual_cli_process_can_shutdown_disposable_workspace_without_runtime_resources(
++    tmp_path: Path,
++) -> None:
++    coordinator, outer, _runner = create_shutdown_fixture(tmp_path)
++
++    completed = subprocess.run(
++        [
++            str(coordinator.manifest.root / "bin/guestspace"),
++            "workspace",
++            "shutdown",
++            str(outer),
++            "--json",
++        ],
++        check=False,
++        capture_output=True,
++        text=True,
++        env={**os.environ, "PATH": "/usr/bin:/bin"},
++    )
++
++    assert completed.returncode == 0, (completed.stdout, completed.stderr)
++    result = json.loads(completed.stdout)
++    assert result["status"] == "ok"
++    assert [item["status"] for item in result["details"]["repositories"]] == ["ok", "ok"]
++    for repository in ("backend", "frontend"):
++        assert (
++            outer / "projects" / repository / ".guestspace/shutdown-called"
++        ).read_text() == "called"
++        assert (
++            outer / "projects" / repository / "source.txt"
++        ).read_text() == f"preserve {repository}\n"
+diff --git a/tests/workspace_shutdown_fixture.py b/tests/workspace_shutdown_fixture.py
+new file mode 100644
+index 0000000..5f66899
+--- /dev/null
++++ b/tests/workspace_shutdown_fixture.py
+@@ -0,0 +1,142 @@
++"""Disposable Git workspace and harmless capability runner for shutdown verification."""
++
++from __future__ import annotations
++
++import json
++import shlex
++import subprocess
++import sys
++from pathlib import Path
++
++import yaml
++
++from guestspace_harness.capabilities import CapabilityExecutor
++from guestspace_harness.composite import CompositeWorkspaceCoordinator
++from guestspace_harness.git import GitClient
++from guestspace_harness.manifest import load_manifest
++from guestspace_harness.task_model import OperationStatus
++from guestspace_harness.task_store import TaskStore
++from guestspace_harness.tasks import TaskCoordinator
++
++
++def git(path: Path, *args: str) -> str:
++    return subprocess.run(
++        ["git", "-C", str(path), *args], check=True, capture_output=True, text=True
++    ).stdout
++
++
++class FakeShutdownRunner:
++    def __init__(self) -> None:
++        self.calls: list[Path] = []
++        self.failures: set[str] = set()
++
++    def __call__(self, command, *, cwd, **_kwargs):
++        self.calls.append(cwd)
++        failed = cwd.name in self.failures
++        return subprocess.CompletedProcess(
++            command,
++            1 if failed else 0,
++            json.dumps({"state": "shutdown", "running": False}) if not failed else "",
++            "fake cleanup failure" if failed else "",
++        )
++
++
++def create_shutdown_fixture(
++    root: Path,
++    *,
++    repositories: tuple[str, ...] = ("backend", "frontend"),
++) -> tuple[CompositeWorkspaceCoordinator, Path, FakeShutdownRunner]:
++    """Create only temporary Git repos; adapter commands write a local marker, never runtimes."""
++    primary = root.resolve() / "primary"
++    primary.mkdir(parents=True)
++    git(primary, "init", "-b", "main")
++    git(primary, "config", "user.name", "Shutdown fixture")
++    git(primary, "config", "user.email", "fixture@example.test")
++    (primary / "config").mkdir()
++    (primary / "bin").mkdir()
++    launcher = primary / "bin/guestspace"
++    entrypoint = (
++        "import sys; from pathlib import Path; from guestspace_harness.cli import main; "
++        "raise SystemExit(main(sys.argv[2:], repository_root=Path(sys.argv[1])))"
++    )
++    launcher.write_text(
++        "#!/bin/sh\nexec "
++        + shlex.join([sys.executable, "-c", entrypoint, str(primary)])
++        + ' "$@"\n'
++    )
++    launcher.chmod(0o755)
++    (primary / ".gitignore").write_text("projects/\ntasks/\n.guestspace/\nTASK.md\n")
++    (primary / "config/repositories.yaml").write_text(
++        yaml.safe_dump(
++            {
++                "schema_version": 1,
++                "workspace": {
++                    "name": "shutdown-fixture",
++                    "projects_path": "projects",
++                    "tasks_path": "tasks",
++                    "worktrees_path": "../worktrees",
++                    "clone_protocol": "ssh",
++                },
++                "repositories": {
++                    name: {
++                        "display_name": name.title(),
++                        "github": f"fixture/{name}",
++                        "path": name,
++                        "default_branch": "main",
++                        "role": name,
++                        "install": True,
++                        "tags": [],
++                    }
++                    for name in repositories
++                },
++            }
++        )
++    )
++    git(primary, "add", ".")
++    git(primary, "commit", "-m", "Fixture control plane")
++    for name in repositories:
++        project = primary / "projects" / name
++        project.mkdir(parents=True)
++        git(project, "init", "-b", "main")
++        git(project, "config", "user.name", "Shutdown fixture")
++        git(project, "config", "user.email", "fixture@example.test")
++        git(project, "remote", "add", "origin", f"git@github.com:fixture/{name}.git")
++        (project / ".guestspace").mkdir()
++        (project / ".gitignore").write_text(".guestspace/shutdown-called\n")
++        (project / "source.txt").write_text(f"preserve {name}\n")
++        capabilities = {}
++        for capability in ("runtime.status", "runtime.shutdown"):
++            script = "import json; print(json.dumps(dict(state='shutdown', running=False)))"
++            if capability == "runtime.shutdown":
++                script = (
++                    "from pathlib import Path; "
++                    "Path('.guestspace/shutdown-called').write_text('called'); " + script
++                )
++            capabilities[capability] = {
++                "command": ["python3", "-c", script],
++                "mode": "foreground",
++                "output": "json",
++                "placeholders": [],
++                "env_placeholders": [],
++                "endpoints": [],
++                "prerequisites": [],
++                "safety": "safe" if capability == "runtime.status" else "external",
++            }
++        (project / ".guestspace/project.yaml").write_text(
++            yaml.safe_dump({"schema_version": 1, "project_id": name, "capabilities": capabilities})
++        )
++        git(project, "add", ".")
++        git(project, "commit", "-m", "Fixture application adapter")
++    manifest = load_manifest(primary / "config/repositories.yaml", repository_root=primary)
++    store = TaskStore(manifest.workspace.tasks_path)
++    runner = FakeShutdownRunner()
++    tasks = TaskCoordinator(manifest, store, git=GitClient(), executor=CapabilityExecutor(runner))
++    coordinator = CompositeWorkspaceCoordinator(manifest, store, tasks=tasks)
++    created = coordinator.create("Shutdown fixture", task_id="20260907-shutdown-fixture-abc123")
++    assert created.status is OperationStatus.OK, created.to_dict()
++    outer = Path(created.details["workspace_path"])
++    for name in repositories:
++        added = coordinator.add_repository(created.task_id, name)
++        assert added.status is OperationStatus.OK, added.to_dict()
++    runner.calls.clear()
++    return coordinator, outer, runner

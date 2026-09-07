@@ -2,7 +2,7 @@ import Foundation
 import Combine
 @testable import WLKit
 
-@MainActor final class LayerFixture: SessionProvider {
+@MainActor final class LayerFixture: SessionControlProvider {
     let requiresEmulator = true
     let title: String
     var opened = 0
@@ -10,6 +10,7 @@ import Combine
     var delay: UInt64 = 0
     var snapshot: [AgentSession]?
     var openedIDs: [String] = []
+    var controls: [SessionControlAction] = []
     init(_ title: String) { self.title = title }
     func listSessions() async throws -> [AgentSession] {
         listed += 1
@@ -17,6 +18,8 @@ import Combine
         return snapshot ?? [AgentSession(id: "same-id", title: title, status: .done, completionID: "same-turn")]
     }
     func openSession(_ session: AgentSession) async throws { opened += 1; openedIDs.append(session.id) }
+    func performControl(_ action: SessionControlAction, text: String) async throws { controls.append(action) }
+    func executeCommand(_ text: String) async throws { throw SessionProviderError.unsupportedInput }
 }
 
 @main struct VerifyLayers {
@@ -25,6 +28,7 @@ import Combine
         try configurationMigration()
         try providerSelectionAcrossLayers()
         try await routingAndBackups()
+        try await combinedControlsAcrossLayers()
         try await inactiveLayerSelectionChange()
         try await interruptedMigration(retry: false)
         try await interruptedMigration(retry: true)
@@ -48,6 +52,58 @@ import Combine
         let restored = try JSONDecoder().decode(SessionConfiguration.self, from: JSONEncoder().encode(settings))
         precondition(restored == settings && restored.selection == .providerOrder)
         print("T3 sidebar order survives alongside cmux recency; every layer validates its provider's modes.")
+    }
+
+    @MainActor static func combinedControlsAcrossLayers() async throws {
+        var settings = SessionConfiguration(reserveCodexSlots: true)
+        settings.target = LayerTarget(profileID: 0, layerID: 0)
+        settings.sessionKeys = [0, 1]
+        settings.actionButtons = [6: .newThread]
+        settings.microControlsEnabled = true
+        settings.selection = .providerOrder
+        let t3ID = settings.selectedLayerID, t3Target = settings.target!
+        settings.addLayer(provider: .cmux)
+        settings.target = LayerTarget(profileID: 0, layerID: 1)
+        settings.sessionKeys = [0, 1]
+        settings.controlBindings = [.init(inputID: Pad.dialUpID, action: .nextTab), .init(inputID: 6, action: .submit)]
+        let cmuxID = settings.selectedLayerID, cmuxTarget = settings.target!
+        try settings.save()
+        let t3 = LayerFixture("T3"), cmux = LayerFixture("cmux")
+        t3.snapshot = [AgentSession(id: "t3", title: "T3", status: .working, providerOrder: 0)]
+        let bridge = BridgeController(providerFactory: { $0.provider == .t3 ? t3 : cmux })
+        await bridge.useEmulator(true)
+        await bridge.applyMapping(for: t3ID)
+        precondition(bridge.lastError == nil, bridge.lastError ?? "")
+        await bridge.applyMapping(for: cmuxID)
+        precondition(bridge.lastError == nil, bridge.lastError ?? "")
+        let pad = bridge.emulator!
+        try pad.activate(t3Target)
+        await bridge.start()
+        precondition(bridge.keymapReady && bridge.configuration.selection == .providerOrder)
+        precondition(pad.slot(forPhysicalKey: 6) == 12 && pad.slot(forPhysicalKey: Pad.dialUpID) == 8)
+        pad.press(0)
+        try await eventually("T3 session routing with action buttons") { t3.opened == 1 }
+        try pad.activate(cmuxTarget)
+        pad.press(Pad.dialUpID)
+        try await eventually("First dial event selects cmux instead of dispatching a T3 control") { cmux.controls == [.nextTab] }
+        pad.press(6)
+        try await eventually("The shared action button uses cmux's action") { cmux.controls == [.nextTab, .submit] }
+        precondition(bridge.keymapReady && bridge.configuration.selectedLayerID == cmuxID)
+        var unreserved = bridge.configuration
+        unreserved.reserveCodexSlots = false
+        await bridge.saveConfiguration(unreserved)
+        await bridge.applyMapping(for: t3ID)
+        precondition(bridge.lastError == nil, bridge.lastError ?? "")
+        try pad.activate(t3Target)
+        await bridge.start()
+        await bridge.forceRepaint()
+        precondition(bridge.keymapReady && pad.slot(forPhysicalKey: 0) == 0 && pad.slot(forPhysicalKey: Pad.dialUpID) == 2)
+        await bridge.restoreMapping(for: t3Target)
+        precondition(bridge.lastError == nil && pad.slot(forPhysicalKey: Pad.dialUpID) == nil)
+        precondition(bridge.hasAppliedMapping(for: cmuxTarget))
+        await bridge.restoreMapping(for: cmuxTarget)
+        precondition(bridge.lastError == nil && !bridge.hasAppliedMapping(for: cmuxTarget))
+        print("T3 actions + sidebar order coexist with cmux controls; shared slots, reservation changes and independent restore passed.")
     }
 
     static func configurationMigration() throws {

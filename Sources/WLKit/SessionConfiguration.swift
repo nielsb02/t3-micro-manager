@@ -62,6 +62,10 @@ public struct SessionLayerConfiguration: Codable, Equatable, Identifiable, Senda
     public var target: LayerTarget?
     public var sessionKeys: [Int] = Pad.agentKeyIDs
     public var controlBindings: [SessionControlBinding] = []
+    public var microControlsEnabled = false
+    public var actionButtons: [Int: T3MicroAction] = [:]
+    public var assignedButtonKeys: [Int] { sessionKeys + (provider == .t3 ? actionButtons.keys.sorted() : []) }
+    public var activeMicroControlsEnabled: Bool { provider == .t3 && microControlsEnabled }
     public var selection: SessionSelectionMode = .mixed
     private var pinsByProvider: [String: [Int: String]] = [:]
     public var driveAmbient = false
@@ -76,7 +80,7 @@ public struct SessionLayerConfiguration: Codable, Equatable, Identifiable, Senda
     }
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, provider, t3, cmux, target, sessionKeys, controlBindings, selection, pinnedSessions, pinsByProvider, driveAmbient
+        case id, name, provider, t3, cmux, target, sessionKeys, controlBindings, selection, pinnedSessions, pinsByProvider, driveAmbient, microControlsEnabled, actionButtons
     }
     public init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
@@ -88,6 +92,8 @@ public struct SessionLayerConfiguration: Codable, Equatable, Identifiable, Senda
         target = try values.decodeIfPresent(LayerTarget.self, forKey: .target)
         sessionKeys = try values.decodeIfPresent([Int].self, forKey: .sessionKeys) ?? Pad.agentKeyIDs
         controlBindings = try values.decodeIfPresent([SessionControlBinding].self, forKey: .controlBindings) ?? []
+        microControlsEnabled = try values.decodeIfPresent(Bool.self, forKey: .microControlsEnabled) ?? false
+        actionButtons = try values.decodeIfPresent([Int: T3MicroAction].self, forKey: .actionButtons) ?? [:]
         selection = try values.decodeIfPresent(SessionSelectionMode.self, forKey: .selection) ?? .mixed
         driveAmbient = try values.decodeIfPresent(Bool.self, forKey: .driveAmbient) ?? false
         if let scoped = try values.decodeIfPresent([String: [Int: String]].self, forKey: .pinsByProvider) {
@@ -106,6 +112,8 @@ public struct SessionLayerConfiguration: Codable, Equatable, Identifiable, Senda
         try values.encodeIfPresent(target, forKey: .target)
         try values.encode(sessionKeys, forKey: .sessionKeys)
         try values.encode(controlBindings, forKey: .controlBindings)
+        try values.encode(microControlsEnabled, forKey: .microControlsEnabled)
+        try values.encode(actionButtons, forKey: .actionButtons)
         try values.encode(selection, forKey: .selection)
         try values.encode(driveAmbient, forKey: .driveAmbient)
         try values.encode(pinsByProvider, forKey: .pinsByProvider)
@@ -140,6 +148,10 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
     public var sessionKeys: [Int] { get { selectedLayer.sessionKeys } set { selectedLayer.sessionKeys = newValue } }
     public var controlBindings: [SessionControlBinding] { get { selectedLayer.controlBindings } set { selectedLayer.controlBindings = newValue } }
     public var activeControlBindings: [SessionControlBinding] { provider == .cmux ? controlBindings : [] }
+    public var microControlsEnabled: Bool { get { selectedLayer.microControlsEnabled } set { selectedLayer.microControlsEnabled = newValue } }
+    public var actionButtons: [Int: T3MicroAction] { get { selectedLayer.actionButtons } set { selectedLayer.actionButtons = newValue } }
+    public var activeMicroControlsEnabled: Bool { selectedLayer.activeMicroControlsEnabled }
+    public var assignedButtonKeys: [Int] { selectedLayer.assignedButtonKeys }
     public var selection: SessionSelectionMode { get { selectedLayer.selection } set { selectedLayer.selection = newValue } }
     public var pinnedSessions: [Int: String] { get { selectedLayer.pinnedSessions } set { selectedLayer.pinnedSessions = newValue } }
     public var driveAmbient: Bool { get { selectedLayer.driveAmbient } set { selectedLayer.driveAmbient = newValue } }
@@ -214,6 +226,21 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
             }
             if layer.provider == .cmux {
                 _ = try LayerMapping.slotAssignments(keys: layer.sessionKeys, controls: layer.controlBindings.map(\.inputID), slotOffset: slotOffset)
+            }
+            if layer.provider == .t3 {
+                guard layer.actionButtons.keys.allSatisfy({ (0...12).contains($0) }),
+                      Set(layer.actionButtons.keys).isDisjoint(with: Set(layer.sessionKeys)),
+                      layer.actionButtons.values.allSatisfy(T3MicroAction.assignableActions.contains) else {
+                    throw ConfigurationError.invalid("Assign T3 actions only to spare buttons. A button can have either a session or an action.")
+                }
+                if layer.microControlsEnabled || !layer.actionButtons.isEmpty {
+                    guard layer.t3.openTarget == .desktop else {
+                        throw ConfigurationError.invalid("T3 actions, the dial, and joystick down require the T3 desktop connection.")
+                    }
+                }
+                if layer.microControlsEnabled && layer.assignedButtonKeys.count + MicroControlMapping.fixedActions.count > 20 - slotOffset {
+                    throw ConfigurationError.invalid("Leave four agent slots for the T3 dial and joystick down.")
+                }
             }
             if let target = layer.target, !targets.insert(target).inserted {
                 throw ConfigurationError.invalid("Each Micro layer can have one provider. Choose a different device layer.")

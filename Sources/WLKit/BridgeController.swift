@@ -94,13 +94,21 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var dialControlsWorkspaces = false
     public var onShowCommands: (() -> Void)?
     public var onControlOverride: ((SessionControlAction) -> Bool)?
-    private var inputTask: Task<Void, Never>?
-    private var inputTasks: [UUID: Task<Void, Never>] = [:]
+    struct QueuedInput {
+        var slot: Int
+        var generation: Int
+        var frontmostProcessID: pid_t?
+    }
+    let inputQueue = OrderedInputQueue<QueuedInput>()
+    private var controlSlots: [T3MicroAction: Int] = [:]
+
+    private func cancelInputs() { inputQueue.cancel() }
 
     private func wire() {
         device.onDisconnect = { [weak self] _ in
             guard let self else { return }
             self.deviceConnected = false; self.layerActive = false; self.keymapReady = false
+            self.controlSlots = [:]; self.cancelInputs()
             self.previousPicture = nil
         }
         device.onTX = { [weak self] _, _, id in self?.issuedIDs.insert(id) }
@@ -115,32 +123,48 @@ public final class BridgeController: ObservableObject {
             guard let self, method == OAI.notifyHID,
                   let value = params as? [String: Any], (value["act"] as? Int) == 1,
                   let slot = OAI.agIndex(value["k"] as? String) else { return }
-            guard self.inputTasks.count < 64 else { return }
-            let inputID = UUID()
-            let previous = self.inputTask
-            let queuedGeneration = self.generation
-            self.inputTask = Task { [weak self] in
-                await previous?.value
-                guard let self else { return }
-                defer { self.inputTasks[inputID] = nil }
-                guard !Task.isCancelled, self.generation == queuedGeneration,
-                      self.isRunning, !self.isBusy else { return }
-                await self.followActiveLayer()
-                let epoch = self.generation
-                if self.sessions.isEmpty { await self.refresh() }
-                guard self.isRunning, !self.isBusy, await self.checkLayer(), self.keymapReady,
-                      self.generation == epoch, !Task.isCancelled else { return }
-                let slots = try? LayerMapping.slotAssignments(keys: self.configuration.sessionKeys,
-                    controls: self.configuration.activeControlBindings.map(\.inputID), slotOffset: self.configuration.slotOffset)
-                if let binding = self.configuration.activeControlBindings.first(where: { slots?[$0.inputID] == slot }) {
-                    do { try await self.performControl(binding.action, text: binding.text) }
-                    catch { if self.generation == epoch { self.lastError = error.localizedDescription } }
-                } else if let key = LayerMapping.physicalKey(forAgentSlot: slot, slotOffset: self.configuration.slotOffset),
-                          let id = self.assignments[key], let session = self.sessions.first(where: { $0.id == id }) {
-                    await self.focusSession(session)
-                }
-            }
-            self.inputTasks[inputID] = self.inputTask
+            guard self.isRunning, !self.isBusy else { return }
+            let event = QueuedInput(slot: slot, generation: self.generation,
+                                    frontmostProcessID: T3DesktopClient.frontmostT3ProcessID)
+            self.inputQueue.enqueue(event) { [weak self] event in await self?.processInput(event) }
+        }
+    }
+
+    private func processInput(_ event: QueuedInput) async {
+        guard !Task.isCancelled, generation == event.generation, isRunning, !isBusy else { return }
+        await followActiveLayer()
+        let epoch = generation
+        if sessions.isEmpty { await refresh() }
+        guard isRunning, !isBusy, await checkLayer(), keymapReady,
+              generation == epoch, !Task.isCancelled else { return }
+        let slots = try? LayerMapping.slotAssignments(keys: configuration.sessionKeys,
+            controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
+        if configuration.provider == .t3, configuration.activeMicroControlsEnabled,
+           let action = controlSlots.first(where: { $0.value == event.slot })?.key {
+            await sendT3Control(action, frontmostProcessID: event.frontmostProcessID, epoch: epoch)
+        } else if configuration.provider == .t3,
+                  let key = LayerMapping.physicalKey(forAgentSlot: event.slot, slotOffset: configuration.slotOffset),
+                  let action = configuration.actionButtons[key] {
+            await sendT3Control(action, frontmostProcessID: event.frontmostProcessID, epoch: epoch)
+        } else if let binding = configuration.activeControlBindings.first(where: { slots?[$0.inputID] == event.slot }) {
+            do { try await performControl(binding.action, text: binding.text) }
+            catch { if generation == epoch { lastError = error.localizedDescription } }
+        } else if let key = LayerMapping.physicalKey(forAgentSlot: event.slot, slotOffset: configuration.slotOffset),
+                  let id = assignments[key], let session = sessions.first(where: { $0.id == id }) {
+            await focusSession(session)
+        }
+    }
+
+    private func sendT3Control(_ action: T3MicroAction, frontmostProcessID: pid_t?, epoch: Int) async {
+        guard let frontmostProcessID, configuration.provider == .t3, configuration.t3.openTarget == .desktop else { return }
+        do {
+            try await T3DesktopClient.sendMicroControl(action, settings: configuration.t3, expectedFrontmostProcessID: frontmostProcessID)
+            if generation == epoch { lastError = nil }
+        } catch T3DesktopError.notFrontmost {
+            cancelInputs()
+        } catch is CancellationError {
+        } catch {
+            if generation == epoch { lastError = error.localizedDescription }
         }
     }
 
@@ -160,15 +184,13 @@ public final class BridgeController: ObservableObject {
     public func stop() async {
         if let stopTask { await stopTask.value; return }
         isRunning = false; generation += 1
-        let pendingInputs = Array(inputTasks.values)
-        for task in pendingInputs { task.cancel() }
-        inputTask = nil
+        cancelInputs()
         pollTask?.cancel(); pollTask = nil
         let pendingRefresh = refreshTask
         pendingRefresh?.cancel()
         let task = Task {
             await pendingRefresh?.value
-            for task in pendingInputs { await task.value }
+            await inputQueue.drain()
             await clearOwnedLights()
             previousPicture = nil
             stopTask = nil
@@ -210,8 +232,14 @@ public final class BridgeController: ObservableObject {
     }
 
     private func readMapping() async throws {
-        deviceKeymap = try await KeymapManager.read(device)
-        availableLayers = try LayerMapping.layers(in: deviceKeymap)
+        do {
+            let current = try await KeymapManager.read(device)
+            let layers = try LayerMapping.layers(in: current)
+            deviceKeymap = current; availableLayers = layers
+        } catch {
+            keymapReady = false; layerActive = false; controlSlots = [:]; cancelInputs()
+            throw error
+        }
         if let data = try? Data(contentsOf: recordURL) {
             let decoder = JSONDecoder()
             if let archive = try? decoder.decode(MappingArchive.self, from: data) {
@@ -226,8 +254,19 @@ public final class BridgeController: ObservableObject {
     }
 
     private func updateMappingReadiness() {
+        defer { if !keymapReady { cancelInputs() } }
+        controlSlots = [:]
+        let layout = mappingRecord.flatMap { try? LayerMapping.selectedLayer(config: deviceKeymap, target: $0.backup.target).layout }
+        for (name, saved) in mappingRecord?.backup.controls ?? [:] {
+            if let action = T3MicroAction(rawValue: name), MicroControlMapping.fixedActions.contains(action),
+               let layout, (try? MicroControlMapping.binding(action, layout: layout)) == saved.ownedCode,
+               saved.ownedCode.hasPrefix("KV_OAI_AG"), let slot = Int(saved.ownedCode.dropFirst(9)),
+               (configuration.slotOffset...19).contains(slot) {
+                controlSlots[action] = slot
+            }
+        }
         guard let target = configuration.target else { keymapReady = false; return }
-        let slots = try? LayerMapping.slotAssignments(keys: configuration.sessionKeys,
+        let slots = try? LayerMapping.slotAssignments(keys: configuration.assignedButtonKeys,
             controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
         keymapReady = mappingRecord?.backup.target == target
             && mappingRecord?.previousBackups == nil && slots != nil
@@ -235,8 +274,10 @@ public final class BridgeController: ObservableObject {
                 mappingRecord?.backup.originals[input] != nil
                     && mappingRecord?.backup.ownedCode(for: input) == String(format: "KV_OAI_AG%02d", slot)
             }
-            && LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys,
-                controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
+            && (!configuration.activeMicroControlsEnabled || controlSlots == (try? MicroControlMapping.slots(
+                config: deviceKeymap, target: target, sessionKeys: configuration.assignedButtonKeys, slotOffset: configuration.slotOffset)))
+            && LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.assignedButtonKeys,
+                controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset, controlsEnabled: configuration.activeMicroControlsEnabled)
     }
 
     public func inspectDevice() async {
@@ -247,6 +288,7 @@ public final class BridgeController: ObservableObject {
     }
 
     @discardableResult private func checkLayer() async -> Bool {
+        defer { if !layerActive { cancelInputs() } }
         guard device.isConnected, let target = configuration.target else { layerActive = false; return false }
         do {
             guard let status = try await device.callAsync("device.status") as? [String: Any] else {
@@ -301,8 +343,13 @@ public final class BridgeController: ObservableObject {
     public var slotConflicts: [String] {
         let managedTargets = Set(configuration.layers.compactMap(\.target))
         let managedSlots = Set(configuration.layers.flatMap { layer in
-            (try? LayerMapping.slotAssignments(keys: layer.sessionKeys,
+            var slots = (try? LayerMapping.slotAssignments(keys: layer.assignedButtonKeys,
                 controls: layer.provider == .cmux ? layer.controlBindings.map(\.inputID) : [], slotOffset: configuration.slotOffset)).map { Array($0.values) } ?? []
+            if layer.activeMicroControlsEnabled, let target = layer.target,
+               let micro = try? MicroControlMapping.slots(config: deviceKeymap, target: target, sessionKeys: layer.assignedButtonKeys, slotOffset: configuration.slotOffset) {
+                slots.append(contentsOf: micro.values)
+            }
+            return slots
         })
         return availableLayers.filter { !managedTargets.contains($0.target) }.compactMap { layer in
             let slots = LayerMapping.agentSlots(config: deviceKeymap, target: layer.target).intersection(managedSlots)
@@ -383,8 +430,8 @@ public final class BridgeController: ObservableObject {
             if let record = mappingRecord {
                 base = try LayerMapping.restoring(config: base, backups: record.recoveryBackups)
             }
-            let backup = try LayerMapping.capture(config: base, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
-            let next = try LayerMapping.applying(config: base, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
+            let backup = try LayerMapping.capture(config: base, target: target, keys: configuration.assignedButtonKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset, controlsEnabled: configuration.activeMicroControlsEnabled)
+            let next = try LayerMapping.applying(config: base, target: target, keys: configuration.assignedButtonKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset, controlsEnabled: configuration.activeMicroControlsEnabled)
             let directory = SessionConfiguration.fileURL.deletingLastPathComponent().appendingPathComponent("backups")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let export = directory.appendingPathComponent("keymap-\(UUID().uuidString).json")
@@ -400,7 +447,7 @@ public final class BridgeController: ObservableObject {
             try persistMappingRecords()
             try await writeMapping(next)
             guard NSDictionary(dictionary: next).isEqual(to: deviceKeymap),
-                  LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset) else {
+                  LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.assignedButtonKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset, controlsEnabled: configuration.activeMicroControlsEnabled) else {
                 throw ConfigurationError.invalid("The device did not retain the selected bindings. The backup is available for restoration.")
             }
             record.previousBackups = nil
@@ -456,9 +503,8 @@ public final class BridgeController: ObservableObject {
             let data = try JSONSerialization.data(withJSONObject: value)
             _ = try await device.callAsync("fs.write", params: ["file": "keymap.json", "data": String(decoding: data, as: UTF8.self)])
         }
-        deviceKeymap = try await KeymapManager.read(device)
-        availableLayers = try LayerMapping.layers(in: deviceKeymap)
-        updateMappingReadiness(); previousPicture = nil
+        try await readMapping()
+        previousPicture = nil
     }
 
     public func testConnection(_ settings: SessionConfiguration) async throws -> [AgentSession] {

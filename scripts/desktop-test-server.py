@@ -11,6 +11,8 @@ root = Path(sys.argv[1])
 digest = hashlib.sha256(b"/Users/test/.t3/userdata").hexdigest()[:24]
 (root / "expected-path").write_text(f"/tmp/t3code-501/{digest}.sock")
 (root / "server-pid").write_text(str(os.getpid()))
+micro_actions = ["dial-clockwise", "dial-counterclockwise", "dial-press", "composer-toggle",
+                 "new-thread", "new-project", "latest-message", "settle-thread", "terminal-toggle", "command-palette"]
 
 
 def serve(mode, server):
@@ -28,6 +30,11 @@ def serve(mode, server):
                 assert not line, "Client sent a session to the wrong app before checking its PID"
                 return
             request = json.loads(line)
+            if mode in micro_actions:
+                assert request == dict(version=1, requestId=request["requestId"], type="micro-control", action=mode)
+                response = dict(version=1, requestId=request["requestId"], ok=True, action=mode)
+                connection.sendall(json.dumps(response).encode() + b"\n")
+                return
             if mode == "wait":
                 connection.recv(1)
                 return
@@ -62,7 +69,7 @@ def serve(mode, server):
 
 
 workers = []
-for mode in ["ok", "id", "env", "thread", "old", "reject", "closed", "large", "wait", "peer", "wrong-peer", "delayed"]:
+for mode in ["ok", "id", "env", "thread", "old", "reject", "closed", "large", "wait", "peer", "wrong-peer", "delayed"] + micro_actions:
     listener = socket.socket(socket.AF_UNIX)
     if mode != "delayed":
         listener.bind(str(root / f"{mode}.sock"))

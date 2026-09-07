@@ -50,17 +50,39 @@ public enum LayerMapping {
         public var target: LayerTarget
         public var originals: [Int: String]
         public var ownedCodes: [Int: String]?
+        public var controls: [String: MicroControlMapping.SavedBinding]?
 
-        public init(target: LayerTarget, originals: [Int: String], ownedCodes: [Int: String]? = nil) {
+        public init(target: LayerTarget, originals: [Int: String], ownedCodes: [Int: String]? = nil,
+                    controls: [String: MicroControlMapping.SavedBinding]? = nil) {
             self.target = target
             self.originals = originals
             self.ownedCodes = ownedCodes
+            self.controls = controls
         }
 
         public func ownedCode(for key: Int) -> String? {
             if let ownedCodes { return ownedCodes[key] }
             // The first release backed up physical keys with same-numbered AG slots.
             return KeymapManager.agCodes.indices.contains(key) ? KeymapManager.agCodes[key] : nil
+        }
+
+        mutating func retainRecovery(from previous: Backup) {
+            for (key, original) in previous.originals where originals[key] == nil {
+                originals[key] = original
+                ownedCodes?[key] = previous.ownedCode(for: key)
+            }
+            for (action, saved) in previous.controls ?? [:] {
+                if controls?[action] != nil {
+                    controls?[action]?.retainRecovery(from: saved)
+                } else {
+                    if controls == nil { controls = [:] }
+                    controls?[action] = saved
+                }
+            }
+        }
+
+        mutating func finishControlRecovery() {
+            for action in controls?.keys.map({ $0 }) ?? [] { controls?[action]?.recoveryOriginals = nil }
         }
     }
 
@@ -134,16 +156,23 @@ public enum LayerMapping {
     }
 
     public static func applying(config: [String: Any], target: LayerTarget,
-                                keys: [Int], controls: [Int] = [], slotOffset: Int = 6) throws -> [String: Any] {
+                                keys: [Int], controls: [Int] = [], slotOffset: Int = 6, controlsEnabled: Bool = false) throws -> [String: Any] {
         let slots = try slotAssignments(keys: keys, controls: controls, slotOffset: slotOffset)
         let selected = try selectedLayer(config: config, target: target)
-        try validateConflicts(slots: slots, layout: selected.layout)
+        guard !controlsEnabled || controls.isEmpty else { throw Failure.invalidControls("Choose one provider's controls per layer.") }
+        let micro = controlsEnabled ? try MicroControlMapping.slots(config: config, target: target, sessionKeys: keys, slotOffset: slotOffset) : [:]
+        if !controlsEnabled { try validateConflicts(slots: slots, layout: selected.layout) }
         return try modifyingLayout(config: config, target: target) { layout in
             for (input, slot) in slots { try setBinding(input, code: code(slot), in: &layout) }
+            for (action, slot) in micro { try MicroControlMapping.set(code(slot), action: action, layout: &layout) }
         }
     }
 
-    public static func isApplied(config: [String: Any], target: LayerTarget, keys: [Int], controls: [Int] = [], slotOffset: Int = 6) -> Bool {
+    public static func isApplied(config: [String: Any], target: LayerTarget, keys: [Int], controls: [Int] = [], slotOffset: Int = 6, controlsEnabled: Bool = false) -> Bool {
+        if controlsEnabled {
+            guard let expected = try? applying(config: config, target: target, keys: keys, controls: controls, slotOffset: slotOffset, controlsEnabled: true) else { return false }
+            return NSDictionary(dictionary: expected).isEqual(to: config)
+        }
         guard let slots = try? slotAssignments(keys: keys, controls: controls, slotOffset: slotOffset),
               let selected = try? selectedLayer(config: config, target: target),
               (try? validateConflicts(slots: slots, layout: selected.layout)) != nil else { return false }
@@ -173,12 +202,20 @@ public enum LayerMapping {
     }
 
     public static func capture(config: [String: Any], target: LayerTarget,
-                               keys: [Int], controls: [Int] = [], slotOffset: Int = 6) throws -> Backup {
+                               keys: [Int], controls: [Int] = [], slotOffset: Int = 6, controlsEnabled: Bool = false) throws -> Backup {
         let slots = try slotAssignments(keys: keys, controls: controls, slotOffset: slotOffset)
         let selected = try selectedLayer(config: config, target: target)
+        guard !controlsEnabled || controls.isEmpty else { throw Failure.invalidControls("Choose one provider's controls per layer.") }
+        var micro: [String: MicroControlMapping.SavedBinding]?
+        if controlsEnabled {
+            micro = [:]
+            for (action, slot) in try MicroControlMapping.slots(config: config, target: target, sessionKeys: keys, slotOffset: slotOffset) {
+                micro?[action.rawValue] = .init(original: try MicroControlMapping.binding(action, layout: selected.layout), ownedCode: code(slot))
+            }
+        }
         return try Backup(target: target,
                           originals: Dictionary(uniqueKeysWithValues: slots.keys.map { ($0, try binding($0, in: selected.layout)) }),
-                          ownedCodes: slots.mapValues(code))
+                          ownedCodes: slots.mapValues(code), controls: micro)
     }
 
     public static func restoring(config: [String: Any], backup: Backup) throws -> [String: Any] {
@@ -195,6 +232,12 @@ public enum LayerMapping {
                     try setBinding(input, code: backup.originals[input]!, in: &layout)
                 }
             }
+            for name in Set(backups.flatMap { Array(($0.controls ?? [:]).keys) }) {
+                guard let action = T3MicroAction(rawValue: name),
+                      let installed = try? MicroControlMapping.binding(action, layout: layout),
+                      let original = backups.lazy.compactMap({ $0.controls?[name]?.original(for: installed) }).first else { continue }
+                try MicroControlMapping.set(original, action: action, layout: &layout)
+            }
         }
     }
 
@@ -207,6 +250,15 @@ public enum LayerMapping {
             return []
         }
         return slots(layout)
+    }
+
+    static func validate(keys: [Int], keymap: [[String]]) throws {
+        guard !keys.isEmpty, Set(keys).count == keys.count else { throw Failure.invalidKeys }
+        for key in keys {
+            guard KeymapManager.agCodes.indices.contains(key), let position = Pad.position(of: key),
+                  keymap.indices.contains(position.row),
+                  keymap[position.row].indices.contains(position.column) else { throw Failure.invalidKeys }
+        }
     }
 
     private static func code(_ slot: Int) -> String { String(format: "KV_OAI_AG%02d", slot) }
@@ -259,7 +311,7 @@ public enum LayerMapping {
         }
     }
 
-    private static func selectedLayer(config: [String: Any], target: LayerTarget) throws
+    static func selectedLayer(config: [String: Any], target: LayerTarget) throws
         -> (profileIndex: Int, layerIndex: Int, layout: [String: Any], keymap: [[String]]) {
         _ = try layers(in: config)
         guard let profiles = config["profiles"] as? [[String: Any]],

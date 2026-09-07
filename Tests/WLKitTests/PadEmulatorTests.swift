@@ -249,4 +249,29 @@ final class PadEmulatorTests: XCTestCase {
         XCTAssertTrue(emulator.bound.isEmpty)
         XCTAssertTrue(emulator.keys.isEmpty)
     }
+
+    func testConfiguredDialPressAndFocusToggleUseAllocatedSlotsInOrder() async throws {
+        let (device, emulator) = try connected()
+        let target = LayerTarget(profileID: 0, layerID: 0)
+        let config = try LayerMapping.applying(config: PadEmulator.stockKeymap(), target: target,
+                                               keys: [0, 1], controlsEnabled: true)
+        try await write(config, to: device)
+        XCTAssertEqual(emulator.slot(forPhysicalKey: Pad.dialPressID), 10)
+        XCTAssertEqual(emulator.slot(forPhysicalKey: Pad.joySouthID), 11)
+        var seen: [Int] = []
+        let presses = expectation(description: "four control events")
+        presses.expectedFulfillmentCount = 4
+        device.onNotification = { method, params in
+            guard method == OAI.notifyHID, let report = params as? [String: Any],
+                  report["act"] as? Int == 1, let slot = OAI.agIndex(report["k"] as? String) else { return }
+            seen.append(slot)
+            presses.fulfill()
+        }
+        for input in [Pad.dialUpID, Pad.dialPressID, Pad.dialDownID, Pad.joySouthID] { emulator.press(input) }
+        await fulfillment(of: [presses], timeout: 2)
+        XCTAssertEqual(seen, [8, 10, 9, 11])
+        try emulator.activate(LayerTarget(profileID: 0, layerID: 1))
+        XCTAssertNil(emulator.slot(forPhysicalKey: Pad.dialPressID))
+        XCTAssertNil(emulator.slot(forPhysicalKey: Pad.joySouthID))
+    }
 }

@@ -149,6 +149,42 @@ Wispr Flow shortcut there. Controls without an action in Micro Manager retain
 their existing bindings, including the wide microphone key. Choosing a microphone position as a
 session key explicitly replaces that position's shortcut on the selected layer.
 
+With **Use the dial and joystick down in T3** enabled, joystick down toggles
+composer focus. When the composer is focused, turn the dial to select a setting
+and press to edit or confirm it. Outside the composer, turn to scroll the
+conversation and press to return to the latest message. These controls require
+a [T3 desktop build with dial support](docs/desktop-opening.md) and act only while that T3 app is
+frontmost. They never launch or raise it. Wispr Flow, Enter, and the other joystick
+directions keep their Input bindings when their buttons remain unselected.
+
+The option starts off for existing and new configurations. Applying it replaces
+only the dial's clockwise, counterclockwise, and press bindings, plus joystick
+down, alongside the selected session buttons. The selected layer must already
+have three dial bindings and one radial joystick down sector. The four controls
+use free slots outside the Codex reservation, excluding session/action slots and
+slots used elsewhere on that layer. With Codex slots reserved, at most 10 session
+and action buttons fit alongside them; without the reservation, all 13 buttons
+fit. Setup reports additional slot conflicts. Turn the option off and choose **Save & apply this layer**
+to return those four bindings to their saved values.
+
+**Spare button actions** offers New chat, New project, Focus/unfocus input,
+Latest message, Settle thread, Toggle terminal, and Command palette. Settle thread
+uses T3's manual settle action for the current saved thread. These actions require
+the T3 desktop connection and run only while the selected T3 app is frontmost.
+They work independently of the dial option.
+
+For project cleanup, T3 actions can opt into **Run when manually settling a
+worktree**. The matching T3 build runs the command in that thread's worktree and
+shows its status and output. GuestSpace's `workspace` project includes an
+importable shutdown action that removes task runtime resources and test data
+while preserving source worktrees. See the [settle setup](docs/desktop-opening.md#project-cleanup-on-settle).
+
+Every spare button starts on **Keep Input binding**. A button can be assigned to
+a session or a T3 action. Microphone and Enter shortcuts remain unchanged while
+their buttons are unassigned. Review and choose **Save & apply this layer** after
+adding or removing button assignments. Removing an assignment restores its
+saved Input binding, preserving later edits made in Input.
+
 Individual status lighting requires the firmware's `KV_OAI_AG…` bindings. The
 app installs those only on selected session positions and configured controls. With **Use Codex desktop buttons**
 enabled, it uses AG06–AG18 and reserves AG00–AG05 for Codex. With that setting
@@ -175,7 +211,7 @@ layers receive no bridge lighting or actions. The panel reports detected slot
 reuse on other layers; independent controllers must also respect the active layer.
 Keep the Codex reservation enabled while its desktop controller is in use.
 
-**Restore buttons** restores the previous values for bindings still owned by
+**Restore controls** restores the previous values for bindings still owned by
 Micro Manager. Later changes made in Input are kept. Restore before moving or
 removing an applied layer configuration. Adding another provider layer keeps the
 existing layer and its restoration record intact. Full device exports and the
@@ -266,6 +302,7 @@ swift test                           # requires Xcode's XCTest framework
 ./scripts/verify-mapping.sh           # also works with Command Line Tools only
 ./scripts/verify-t3.sh
 ./scripts/verify-desktop.sh           # real local sockets; no running T3 needed
+./scripts/verify-micro-controls.sh    # dial mapping, restoration, routing and event order
 python3 scripts/verify-signing.py      # temporary certificate + two distinct builds
 ./scripts/verify-emulator.sh
 ./scripts/verify-bridge.sh            # isolated config + emulator; no hardware

@@ -189,8 +189,8 @@ public enum Pad {
     /// to the AG codes above 12 turns rotations and deflections into the same
     /// `v.oai.hid` reports. These IDs never light — nothing is under them.
     public static let dialUpID = 13     // encoder, clockwise detent
-    public static let dialPressID = 19
     public static let dialDownID = 14   // encoder, counter-clockwise detent
+    public static let dialPressID = 19  // physical input ID; its AG slot comes from the mapping
     /// The joystick's four cardinal sectors, named by the angle fraction at
     /// their centre in the radial map (0 = east, counter-clockwise).
     public static let joyNorthID = 15   // sector centred on 0.25

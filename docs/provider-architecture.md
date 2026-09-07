@@ -102,7 +102,12 @@ or unsupported input. A provider must also validate its inputs and target IDs.
 Inputs are sent only on an explicit caller request, never in response to status
 changes. No input is automatically submitted, approved or retried by the bridge.
 
-T3 does not implement this optional interface: its current pairing is read-only.
+T3 does not implement this optional text-input interface: its HTTP pairing is read-only.
+Its opt-in dial, joystick and spare-button actions use the separate desktop control
+socket with request/reply validation and a frontmost-application check. Each T3
+layer retains its own control settings. Both providers use the same bounded input
+queue; layer changes, invalid mappings and stopping cancel stale events, and
+stopping drains in-flight work before switching connections.
 cmux also implements `SessionControlProvider` for current-pane navigation,
 workspace navigation, explicit input and named voice commands. Layer-specific
 `controlBindings` connect buttons, encoder events and joystick directions to
