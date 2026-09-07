@@ -35,6 +35,9 @@ jobs:
           ./scripts/verify-providers.sh
           ./scripts/verify-bridge.sh
           ./scripts/verify-desktop.sh
+          ./scripts/verify-layers.sh
+          ./scripts/verify-cmux.sh
+          ./scripts/verify-controls.sh
 
       - name: Bundle
         run: ./scripts/bundle.sh

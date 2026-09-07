@@ -264,6 +264,7 @@ public final class PadEmulator: ObservableObject {
                     if let encoders = layout["encoders"] as? [[String]], let dial = encoders.first {
                         if dial.indices.contains(0) { inputs[Pad.dialUpID] = slot(dial[0]) }
                         if dial.indices.contains(1) { inputs[Pad.dialDownID] = slot(dial[1]) }
+                        if dial.indices.contains(2) { inputs[Pad.dialPressID] = slot(dial[2]) }
                     }
                     if let joystick = layout["joystick"] as? [String: Any],
                        let sectors = joystick["sectors"] as? [[String: Any]] {

@@ -84,6 +84,7 @@ public enum SessionProviders {
     @MainActor public static func make(configuration: SessionConfiguration) -> any SessionProvider {
         switch configuration.provider {
         case .t3: return T3SessionProvider(settings: configuration.t3)
+        case .cmux: return CmuxSessionProvider(settings: configuration.cmux)
         case .herdr: return HerdrSessionProvider()
         case .demo: return DemoSessionProvider()
         }

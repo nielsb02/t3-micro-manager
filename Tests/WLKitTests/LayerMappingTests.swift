@@ -2,6 +2,15 @@ import XCTest
 @testable import WLKit
 
 final class LayerMappingTests: XCTestCase {
+    func testOptionalCodexReservationUsesFirstSlots() throws {
+        XCTAssertEqual(LayerMapping.agentSlot(forPhysicalKey: 0, slotOffset: 0), 0)
+        XCTAssertEqual(LayerMapping.agentSlot(forPhysicalKey: 5, slotOffset: 0), 5)
+        XCTAssertEqual(LayerMapping.physicalKey(forAgentSlot: 0, slotOffset: 0), 0)
+        XCTAssertEqual(LayerMapping.physicalKey(forAgentSlot: 19, slotOffset: 0), nil)
+        XCTAssertEqual(LayerMapping.agentSlot(forPhysicalKey: 0, slotOffset: 6), 6)
+        XCTAssertEqual(LayerMapping.physicalKey(forAgentSlot: 5, slotOffset: 6), nil)
+    }
+
     private func fixture() throws -> [String: Any] {
         let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
             .appendingPathComponent("Fixtures/stock-keymap.json")

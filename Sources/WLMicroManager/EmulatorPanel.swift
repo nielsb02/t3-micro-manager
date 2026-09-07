@@ -100,6 +100,8 @@ struct EmulatorView: View {
 
             HStack(spacing: 10) {
                 stepper("Dial", down: Pad.dialDownID, up: Pad.dialUpID)
+                Button("Press") { emulator.press(Pad.dialPressID) }
+                    .disabled(emulator.slot(forPhysicalKey: Pad.dialPressID) == nil)
                 Spacer(minLength: 0)
                 joystick
             }
