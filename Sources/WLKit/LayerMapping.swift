@@ -42,17 +42,39 @@ public enum LayerMapping {
         public var target: LayerTarget
         public var originals: [Int: String]
         public var ownedCodes: [Int: String]?
+        public var controls: [String: MicroControlMapping.SavedBinding]?
 
-        public init(target: LayerTarget, originals: [Int: String], ownedCodes: [Int: String]? = nil) {
+        public init(target: LayerTarget, originals: [Int: String], ownedCodes: [Int: String]? = nil,
+                    controls: [String: MicroControlMapping.SavedBinding]? = nil) {
             self.target = target
             self.originals = originals
             self.ownedCodes = ownedCodes
+            self.controls = controls
         }
 
         public func ownedCode(for key: Int) -> String? {
             if let ownedCodes { return ownedCodes[key] }
             // The first release backed up physical keys with same-numbered AG slots.
             return KeymapManager.agCodes.indices.contains(key) ? KeymapManager.agCodes[key] : nil
+        }
+
+        mutating func retainRecovery(from previous: Backup) {
+            for (key, original) in previous.originals where originals[key] == nil {
+                originals[key] = original
+                ownedCodes?[key] = previous.ownedCode(for: key)
+            }
+            for (action, saved) in previous.controls ?? [:] {
+                if controls?[action] != nil {
+                    controls?[action]?.retainRecovery(from: saved)
+                } else {
+                    if controls == nil { controls = [:] }
+                    controls?[action] = saved
+                }
+            }
+        }
+
+        mutating func finishControlRecovery() {
+            for action in controls?.keys.map({ $0 }) ?? [] { controls?[action]?.recoveryOriginals = nil }
         }
     }
 
@@ -109,19 +131,30 @@ public enum LayerMapping {
     }
 
     public static func applying(config: [String: Any], target: LayerTarget,
-                                keys: [Int]) throws -> [String: Any] {
+                                keys: [Int], controlsEnabled: Bool = false) throws -> [String: Any] {
         let selected = try selectedLayer(config: config, target: target)
         try validate(keys: keys, keymap: selected.keymap)
-        try validateConflicts(keys: keys, layout: selected.layout)
-        return try modifying(config: config, target: target) { keymap in
+        let controls = controlsEnabled ? try MicroControlMapping.slots(config: config, target: target, sessionKeys: keys) : [:]
+        if !controlsEnabled { try validateConflicts(keys: keys, layout: selected.layout) }
+        return try modifyingLayout(config: config, target: target) { layout in
+            var keymap = selected.keymap
             for key in keys {
                 let position = Pad.position(of: key)!
                 keymap[position.row][position.column] = agentCode(forPhysicalKey: key)!
             }
+            layout["keymap"] = keymap
+            for (action, slot) in controls {
+                try MicroControlMapping.set(MicroControlMapping.code(slot), action: action, layout: &layout)
+            }
         }
     }
 
-    public static func isApplied(config: [String: Any], target: LayerTarget, keys: [Int]) -> Bool {
+    public static func isApplied(config: [String: Any], target: LayerTarget, keys: [Int],
+                                 controlsEnabled: Bool = false) -> Bool {
+        if controlsEnabled {
+            guard let expected = try? applying(config: config, target: target, keys: keys, controlsEnabled: true) else { return false }
+            return NSDictionary(dictionary: expected).isEqual(to: config)
+        }
         guard let selected = try? selectedLayer(config: config, target: target),
               (try? validate(keys: keys, keymap: selected.keymap)) != nil,
               (try? validateConflicts(keys: keys, layout: selected.layout)) != nil else { return false }
@@ -154,32 +187,49 @@ public enum LayerMapping {
     }
 
     public static func capture(config: [String: Any], target: LayerTarget,
-                               keys: [Int]) throws -> Backup {
+                               keys: [Int], controlsEnabled: Bool = false) throws -> Backup {
         let selected = try selectedLayer(config: config, target: target)
         try validate(keys: keys, keymap: selected.keymap)
         let originals = Dictionary(uniqueKeysWithValues: keys.map { key in
             let position = Pad.position(of: key)!
             return (key, selected.keymap[position.row][position.column])
         })
+        var controls: [String: MicroControlMapping.SavedBinding]?
+        if controlsEnabled {
+            controls = [:]
+            for (action, slot) in try MicroControlMapping.slots(config: config, target: target, sessionKeys: keys) {
+                controls?[action.rawValue] = .init(original: try MicroControlMapping.binding(action, layout: selected.layout),
+                                                  ownedCode: MicroControlMapping.code(slot))
+            }
+        }
         return Backup(target: target, originals: originals,
-                      ownedCodes: Dictionary(uniqueKeysWithValues: keys.map { ($0, agentCode(forPhysicalKey: $0)!) }))
+                      ownedCodes: Dictionary(uniqueKeysWithValues: keys.map { ($0, agentCode(forPhysicalKey: $0)!) }),
+                      controls: controls)
     }
 
     /// A button edited later in Input keeps that newer binding when the integration is removed.
     public static func restoring(config: [String: Any], backup: Backup) throws -> [String: Any] {
         let selected = try selectedLayer(config: config, target: backup.target)
         try validate(keys: Array(backup.originals.keys), keymap: selected.keymap)
-        return try modifying(config: config, target: backup.target) { keymap in
+        return try modifyingLayout(config: config, target: backup.target) { layout in
+            var keymap = selected.keymap
             for (key, original) in backup.originals {
                 let position = Pad.position(of: key)!
                 if keymap[position.row][position.column] == backup.ownedCode(for: key) {
                     keymap[position.row][position.column] = original
                 }
             }
+            layout["keymap"] = keymap
+            for (name, saved) in backup.controls ?? [:] {
+                guard let action = T3MicroAction(rawValue: name),
+                      let installed = try? MicroControlMapping.binding(action, layout: layout),
+                      let original = saved.original(for: installed) else { continue }
+                try MicroControlMapping.set(original, action: action, layout: &layout)
+            }
         }
     }
 
-    private static func validate(keys: [Int], keymap: [[String]]) throws {
+    static func validate(keys: [Int], keymap: [[String]]) throws {
         guard !keys.isEmpty, Set(keys).count == keys.count else { throw Failure.invalidKeys }
         for key in keys {
             guard KeymapManager.agCodes.indices.contains(key), let position = Pad.position(of: key),
@@ -209,7 +259,7 @@ public enum LayerMapping {
         try check(remaining)
     }
 
-    private static func selectedLayer(config: [String: Any], target: LayerTarget) throws
+    static func selectedLayer(config: [String: Any], target: LayerTarget) throws
         -> (profileIndex: Int, layerIndex: Int, layout: [String: Any], keymap: [[String]]) {
         _ = try layers(in: config)
         guard let profiles = config["profiles"] as? [[String: Any]],
@@ -221,16 +271,14 @@ public enum LayerMapping {
         return (profileIndex, layerIndex, layout, keymap)
     }
 
-    private static func modifying(config: [String: Any], target: LayerTarget,
-                                  edit: (inout [[String]]) -> Void) throws -> [String: Any] {
+    private static func modifyingLayout(config: [String: Any], target: LayerTarget,
+                                        edit: (inout [String: Any]) throws -> Void) throws -> [String: Any] {
         let selected = try selectedLayer(config: config, target: target)
         var next = config
         var profiles = next["profiles"] as! [[String: Any]]
         var layers = profiles[selected.profileIndex]["layers"] as! [[String: Any]]
         var layout = selected.layout
-        var keymap = selected.keymap
-        edit(&keymap)
-        layout["keymap"] = keymap
+        try edit(&layout)
         layers[selected.layerIndex]["layout"] = layout
         profiles[selected.profileIndex]["layers"] = layers
         next["profiles"] = profiles

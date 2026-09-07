@@ -27,7 +27,7 @@ you can switch its active layer to check that the bridge pauses on other layers.
 The demo does not change hardware or overwrite your saved T3 connection.
 
 The app starts disabled on first launch. It does not install bindings on startup
-or reconnect. A device setup requires **Save & apply selected keys**.
+or reconnect. A device setup requires **Save & apply controls**.
 
 ## Connect your local T3 instance
 
@@ -67,14 +67,52 @@ are deferred; this version lists the configured server's own sessions.
    app after granting it, then read the layers again.
 3. Select an existing profile/layer by its name. Leave your Codex layer alone.
 4. Click the buttons you want to use as session keys. The initial selection is
-   the top six buttons; every selection is configurable.
-5. Review the selected binding changes and choose **Save & apply selected keys**.
-6. Enable Micro Manager and switch the pad to that layer.
+   the top six buttons; every selection is configurable. Under **Spare button
+   actions**, optionally assign T3 actions to other buttons.
+5. Optionally enable **Use the dial and joystick down in T3** for the controls below.
+6. Review the selected binding changes and choose **Save & apply controls**.
+7. Enable Micro Manager and switch the pad to that layer.
 
 Work Louder Input remains your hardware configurator. Keep the Control+Option
-Wispr Flow shortcut there. The wide microphone key, dial, joystick, and other
-unselected buttons retain their bindings. Choosing a microphone position as a
+Wispr Flow shortcut there. The wide microphone key and other unselected buttons
+retain their bindings. The dial and joystick keep their bindings unless you enable
+the T3 controls. Choosing a microphone position as a
 session key explicitly replaces that position's shortcut on the selected layer.
+
+With **Use the dial and joystick down in T3** enabled, joystick down toggles
+composer focus. When the composer is focused, turn the dial to select a setting
+and press to edit or confirm it. Outside the composer, turn to scroll the
+conversation and press to return to the latest message. These controls require
+a [T3 desktop build with dial support](docs/desktop-opening.md) and act only while that T3 app is
+frontmost. They never launch or raise it. Wispr Flow, Enter, and the other joystick
+directions keep their Input bindings when their buttons remain unselected.
+
+The option starts off for existing and new configurations. Applying it replaces
+only the dial's clockwise, counterclockwise, and press bindings, plus joystick
+down, alongside the selected session buttons. The selected layer must already
+have three dial bindings and one radial joystick down sector. The four controls
+use free AG06 through AG19 slots, excluding session slots and slots used elsewhere
+on that layer. At most 10 session and action buttons in total fit alongside them; setup reports any
+additional slot conflicts. Turn the option off and choose **Save & apply controls**
+to return those four bindings to their saved values.
+
+**Spare button actions** offers New chat, New project, Focus/unfocus input,
+Latest message, Settle thread, Toggle terminal, and Command palette. Settle thread
+uses T3's manual settle action for the current saved thread. These actions require
+the T3 desktop connection and run only while the selected T3 app is frontmost.
+They work independently of the dial option.
+
+For project cleanup, T3 actions can opt into **Run when manually settling a
+worktree**. The matching T3 build runs the command in that thread's worktree and
+shows its status and output. GuestSpace's `workspace` project includes an
+importable shutdown action that removes task runtime resources and test data
+while preserving source worktrees. See the [settle setup](docs/desktop-opening.md#project-cleanup-on-settle).
+
+Every spare button starts on **Keep Input binding**. A button can be assigned to
+a session or a T3 action. Microphone and Enter shortcuts remain unchanged while
+their buttons are unassigned. Review and choose **Save & apply controls** after
+adding or removing button assignments. Removing an assignment restores its
+saved Input binding, preserving later edits made in Input.
 
 Individual status lighting requires the firmware's `KV_OAI_AG…` bindings. The
 app installs those only on selected positions. It uses AG06–AG18, reserving
@@ -88,19 +126,21 @@ position IDs. See the [top-row mapping check](docs/top-row-mapping.md).
 
 All twenty AG slots (AG00–AG19) are shared across layers. A key event identifies
 the slot, without identifying its layer. With the default six T3 buttons,
-Codex uses AG00–AG05, T3 uses AG06–AG11, and AG12–AG19 remain available for another
-integration. Selecting additional T3 buttons uses more of that remaining range.
+Codex uses AG00–AG05 and T3 session keys use AG06–AG11. Assigned action buttons
+use their physical button number plus six. The optional dial and
+joystick controls take four free slots in the remaining range. Selecting
+additional session or action buttons uses more of that range.
 Use separate slots for independent apps. Reusing slots between layers requires
 every controller to check the active layer and coordinate the shared LEDs;
 Micro Manager's layer check cannot control another app's behavior. The current
 dashboard manages one provider/layer at a time.
 
-**Restore buttons** restores the previous values for bindings still owned by
+**Restore controls** restores the previous values for bindings still owned by
 Micro Manager. Later changes made in Input are kept. Restore before moving the
 integration to a different layer. Full device exports and the restoration record
 are saved before device writes; the dashboard can reveal the backup.
 
-If you applied the first build, choose **Save & apply selected keys** once in the
+If you applied the first build, choose **Save & apply controls** once in the
 updated app to migrate its conflicting AG00–AG05 bindings. The saved original
 shortcuts are retained for restoration.
 
@@ -172,6 +212,7 @@ swift test                           # requires Xcode's XCTest framework
 ./scripts/verify-mapping.sh           # also works with Command Line Tools only
 ./scripts/verify-t3.sh
 ./scripts/verify-desktop.sh           # real local sockets; no running T3 needed
+./scripts/verify-micro-controls.sh    # dial mapping, restoration, routing and event order
 python3 scripts/verify-signing.py      # temporary certificate + two distinct builds
 ./scripts/verify-emulator.sh
 ./scripts/verify-bridge.sh            # isolated config + emulator; no hardware

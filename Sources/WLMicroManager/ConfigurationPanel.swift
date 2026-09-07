@@ -249,30 +249,31 @@ struct ConfigurationPanel: View {
                         Text("Click the keys to use for sessions.").font(.callout).bold()
                         Text("\(draft.sessionKeys.count) selected")
                             .font(.caption).foregroundStyle(.tint)
-                        Text("Keep Wispr Flow on an unselected key. Configure the dial, joystick, and other shortcuts in Input.")
+                        Text("Keep Wispr Flow and Enter on unselected keys. Configure ordinary shortcuts in Input.")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Text("The wide bottom key has two positions, 10 and 11. Both are left free by default.")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        if draft.sessionKeys.contains(10) || draft.sessionKeys.contains(11) {
+                        if draft.assignedButtonKeys.contains(10) || draft.assignedButtonKeys.contains(11) {
                             Text("Selecting the wide key replaces its existing shortcut on this layer.")
                                 .font(.caption).foregroundStyle(.orange)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 }
+                actionButtonSection
                 if let layer = selectedLayer {
                     DisclosureGroup("Review selected button changes") {
                         VStack(spacing: 5) {
-                            ForEach(draft.sessionKeys, id: \.self) { key in
+                            ForEach(draft.assignedButtonKeys.sorted(), id: \.self) { key in
                                 HStack {
                                     Text("Key \(key)").frame(width: 50, alignment: .leading)
                                     Text(existingBinding(key, layer: layer))
                                         .foregroundStyle(.secondary).lineLimit(1)
                                     Spacer()
                                     Image(systemName: "arrow.right").foregroundStyle(.secondary)
-                                    Text("Session control")
+                                    Text(draft.actionButtons[key]?.title ?? "Session control")
                                 }
                                 .font(.caption)
                             }
@@ -280,9 +281,27 @@ struct ConfigurationPanel: View {
                         .padding(.top, 8)
                     }
                 }
+                Toggle("Use the dial and joystick down in T3", isOn: $draft.microControlsEnabled)
+                    .toggleStyle(.checkbox)
+                if draft.microControlsEnabled {
+                    Text("Joystick down toggles composer focus. In the composer, rotate to choose a setting and press to edit or confirm it. Outside the composer, rotate to scroll and press to jump to the latest message. T3 must be frontmost.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("Apply replaces only dial rotation, dial press, and joystick down alongside your assigned buttons. Restore controls returns their saved bindings.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if draft.assignedButtonKeys.count > 10 {
+                        Text("Assign at most 10 session and action buttons in total to leave room for these four controls.")
+                            .font(.caption).foregroundStyle(.red)
+                    }
+                    if draft.provider != .t3 || draft.t3.openTarget != .desktop {
+                        Text("Choose the T3 desktop connection to enable these controls.")
+                            .font(.caption).foregroundStyle(.red)
+                    }
+                }
                 Toggle("Use the ambient light for overall session status", isOn: $draft.driveAmbient)
                     .toggleStyle(.checkbox)
-                Text("The bridge is active only on the selected layer. Apply saves a backup before changing selected buttons.")
+                Text("The bridge is active only on the selected layer. Apply saves a backup before changing selected controls.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let backup = bridge.backupPath {
@@ -293,7 +312,7 @@ struct ConfigurationPanel: View {
                         Button("Show backup") {
                             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: backup)])
                         }
-                        Button("Restore buttons") { restoreMapping() }
+                        Button("Restore controls") { restoreMapping() }
                     }
                 }
             }
@@ -302,6 +321,39 @@ struct ConfigurationPanel: View {
         } label: {
             Label("Layer & keys", systemImage: "keyboard").font(.headline)
         }
+    }
+
+    private var actionButtonSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Spare button actions").font(.callout).bold()
+            Text("Assign a T3 action to any button that is not used for sessions. Keep Input binding leaves its shortcut unchanged. Actions run only while your T3 desktop is frontmost.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ForEach((0...12).filter { !draft.sessionKeys.contains($0) }, id: \.self) { key in
+                Picker("Key \(key)", selection: actionBinding(key)) {
+                    Text("Keep Input binding").tag("")
+                    ForEach(T3MicroAction.assignableActions, id: \.self) { action in
+                        Text(action.title).tag(action.rawValue)
+                    }
+                }
+            }
+            if draft.actionButtons[10] != nil || draft.actionButtons[11] != nil || draft.actionButtons[12] != nil {
+                Text("Assigning a bottom-row button replaces its current microphone or Enter shortcut. Leave it on Keep Input binding to preserve that shortcut.")
+                    .font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !draft.actionButtons.isEmpty && (draft.provider != .t3 || draft.t3.openTarget != .desktop) {
+                Text("Choose the T3 desktop connection to use these actions.")
+                    .font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func actionBinding(_ key: Int) -> Binding<String> {
+        Binding(
+            get: { draft.actionButtons[key]?.rawValue ?? "" },
+            set: { draft.actionButtons[key] = T3MicroAction(rawValue: $0) }
+        )
     }
 
     private var assignmentSection: some View {
@@ -358,7 +410,7 @@ struct ConfigurationPanel: View {
                 Spacer()
                 Button("Save settings") { saveSettings(apply: false) }
                     .disabled(busy != nil || bridge.isBusy || draft.sessionKeys.isEmpty)
-                Button("Save & apply selected keys") { saveSettings(apply: true) }
+                Button("Save & apply controls") { saveSettings(apply: true) }
                     .buttonStyle(.borderedProminent)
                     .disabled(busy != nil || bridge.isBusy || draft.target == nil || draft.sessionKeys.isEmpty)
             }
@@ -400,6 +452,11 @@ struct ConfigurationPanel: View {
     }
 
     private func toggleKey(_ key: Int) {
+        guard draft.actionButtons[key] == nil else {
+            feedback = "Set Key \(key) to Keep Input binding before using it for sessions."
+            feedbackIsError = true
+            return
+        }
         if draft.sessionKeys.contains(key) {
             draft.sessionKeys.removeAll { $0 == key }
             draft.pinnedSessions[key] = nil
@@ -463,7 +520,7 @@ struct ConfigurationPanel: View {
 
     private func saveSettings(apply: Bool) {
         let settings = draft
-        run(apply ? "Backing up and applying selected keys…" : "Saving settings…") {
+        run(apply ? "Backing up and applying selected controls…" : "Saving settings…") {
             try settings.validate()
             await bridge.saveConfiguration(settings)
             try checkBridgeError()
@@ -471,17 +528,17 @@ struct ConfigurationPanel: View {
             if apply {
                 await bridge.applyMapping()
                 try checkBridgeError()
-                return "Selected keys applied. Enable Micro Manager and switch to your chosen layer."
+                return "Selected controls applied. Enable Micro Manager and switch to your chosen layer."
             }
             return "Settings saved. Device bindings are changed with Apply."
         }
     }
 
     private func restoreMapping() {
-        run("Restoring button bindings…") {
+        run("Restoring control bindings…") {
             await bridge.restoreMapping()
             try checkBridgeError()
-            return "Original button bindings restored."
+            return "Original control bindings restored."
         }
     }
 

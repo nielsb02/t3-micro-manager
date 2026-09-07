@@ -81,6 +81,15 @@ import Darwin
         } catch T3DesktopError.timeout { }
         print("PASS: optional app selection, symlink resolution, socket owner verification and bounded startup wait")
 
+        for action in T3MicroAction.allCases {
+            let request = T3DesktopClient.MicroRequest(requestId: UUID().uuidString, action: action)
+            let reply = try T3DesktopClient.exchange(path: root + "/\(action.rawValue).sock",
+                                                    payload: JSONEncoder().encode(request) + Data([10]),
+                                                    expectedProcessID: serverPID)
+            try T3DesktopClient.validateResponse(reply, request: request)
+        }
+        print("PASS: every dial and assignable-button action round-trips over owner-verified sockets")
+
         for fixture in ["id", "env", "thread", "old", "reject", "closed", "large"] {
             settings.desktopSocketPath = root + "/\(fixture).sock"
             do {

@@ -1,0 +1,4652 @@
+diff --git a/apps/desktop/src/app/DesktopAppActivation.test.ts b/apps/desktop/src/app/DesktopAppActivation.test.ts
+index de124733..b7a34a6d 100644
+--- a/apps/desktop/src/app/DesktopAppActivation.test.ts
++++ b/apps/desktop/src/app/DesktopAppActivation.test.ts
+@@ -8,18 +8,21 @@ import {
+   EnvironmentId,
+   ProjectId,
+   ThreadId,
++  DesktopAppActivationResponse,
+   type DesktopAppActivationRequest,
+-  type DesktopAppActivationResponse,
++  type MicroControlAction,
+ } from "@t3tools/contracts";
+ import { resolveDesktopAppControlAddress } from "@t3tools/shared/desktopAppControl";
+ import { HostProcessPlatform, HostProcessUserId } from "@t3tools/shared/hostProcess";
+ import { it } from "@effect/vitest";
+ import * as Effect from "effect/Effect";
++import * as Schema from "effect/Schema";
+ import { afterEach, describe, expect } from "vite-plus/test";
+ 
+ import { startDesktopAppControlServer } from "./DesktopAppActivation.ts";
+ 
+ const openServers: Array<{ close: () => Promise<void> }> = [];
++const decodeResponse = Schema.decodeUnknownSync(DesktopAppActivationResponse);
+ 
+ afterEach(async () => {
+   await Promise.all(openServers.splice(0).map((server) => server.close()));
+@@ -45,24 +48,109 @@ function request(requestId: string, platform: NodeJS.Platform): DesktopAppActiva
+   };
+ }
+ 
+-function exchange(address: string, payload: DesktopAppActivationRequest) {
++function exchange(address: string, payload: unknown) {
++  return exchangeLine(address, JSON.stringify(payload));
++}
++
++function exchangeLine(address: string, line: string) {
+   return new Promise<DesktopAppActivationResponse>((resolve, reject) => {
+     const socket = NodeNet.createConnection(address);
+     socket.setEncoding("utf8");
+     let buffer = "";
+     socket.once("error", reject);
+-    socket.once("connect", () => socket.write(`${JSON.stringify(payload)}\n`));
++    socket.once("connect", () => socket.write(`${line}\n`));
+     socket.on("data", (chunk) => {
+       buffer += chunk;
+       const newline = buffer.indexOf("\n");
+       if (newline === -1) return;
+       socket.destroy();
+-      resolve(JSON.parse(buffer.slice(0, newline)) as DesktopAppActivationResponse);
++      try {
++        resolve(decodeResponse(JSON.parse(buffer.slice(0, newline))));
++      } catch (error) {
++        reject(error);
++      }
+     });
+   });
+ }
+ 
+ describe("desktop app control server", () => {
++  it.effect("roundtrips every Micro action and rejects malformed requests before dispatch", () =>
++    Effect.gen(function* () {
++      const platform = yield* HostProcessPlatform;
++      const userId = yield* HostProcessUserId;
++      yield* Effect.promise(async () => {
++        const root = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-micro-control-"));
++        const target = makeTarget(NodePath.join(root, "userdata"), platform, userId);
++        const received: MicroControlAction[] = [];
++        const server = await startDesktopAppControlServer({
++          ...target,
++          userId,
++          cancel: () => undefined,
++          handle: async (input) => {
++            if (input.type !== "micro-control") throw new Error("Unexpected request type");
++            received.push(input.action);
++            return { version: 1, requestId: input.requestId, ok: true, action: input.action };
++          },
++        });
++        openServers.push(server);
++        try {
++          const actions: MicroControlAction[] = [
++            "dial-clockwise",
++            "dial-counterclockwise",
++            "dial-press",
++            "composer-toggle",
++            "new-thread",
++            "new-project",
++            "latest-message",
++            "settle-thread",
++            "terminal-toggle",
++            "command-palette",
++          ];
++          for (const action of actions) {
++            expect(
++              await exchange(target.address, {
++                version: 1,
++                requestId: action,
++                type: "micro-control",
++                action,
++              }),
++            ).toEqual({ version: 1, requestId: action, ok: true, action });
++          }
++          expect(received).toEqual(actions);
++
++          const payload = {
++            version: 1,
++            requestId: "invalid-micro",
++            type: "micro-control",
++            action: "dial-press",
++          };
++          for (const invalid of [
++            { ...payload, version: 2 },
++            { ...payload, action: "dial-up" },
++            { ...payload, action: undefined },
++            { ...payload, action: null },
++            { ...payload, type: "micro" },
++          ]) {
++            expect(await exchange(target.address, invalid)).toMatchObject({
++              requestId: payload.requestId,
++              ok: false,
++              code: "invalid-request",
++            });
++          }
++          expect(await exchangeLine(target.address, "{invalid")).toMatchObject({
++            ok: false,
++            code: "invalid-request",
++          });
++          expect(received).toEqual(actions);
++        } finally {
++          await server.close();
++          openServers.splice(openServers.indexOf(server), 1);
++          await NodeFSP.rm(root, { recursive: true, force: true });
++        }
++      });
++    }),
++  );
++
+   it.effect("roundtrips an open-thread request and a renderer rejection", () =>
+     Effect.gen(function* () {
+       const platform = yield* HostProcessPlatform;
+diff --git a/apps/desktop/src/app/DesktopAppActivationBroker.test.ts b/apps/desktop/src/app/DesktopAppActivationBroker.test.ts
+index 7a889c2e..f40c1270 100644
+--- a/apps/desktop/src/app/DesktopAppActivationBroker.test.ts
++++ b/apps/desktop/src/app/DesktopAppActivationBroker.test.ts
+@@ -1,4 +1,11 @@
+-import { ProjectId, ThreadId, type DesktopAppActivationRequest } from "@t3tools/contracts";
++import {
++  ProjectId,
++  ThreadId,
++  type DesktopAppActivationRequest,
++  type DesktopAppActivationResponse,
++  type DesktopAppMicroControlRequest,
++  type MicroControlAction,
++} from "@t3tools/contracts";
+ import { describe, expect, it, vi } from "vite-plus/test";
+ 
+ import { DesktopAppActivationBroker } from "./DesktopAppActivationBroker.ts";
+@@ -11,7 +18,145 @@ const request: DesktopAppActivationRequest = {
+   platform: "linux",
+ };
+ 
++const microRequest: DesktopAppMicroControlRequest = {
++  version: 1,
++  requestId: "micro-1",
++  type: "micro-control",
++  action: "dial-clockwise",
++};
++
+ describe("DesktopAppActivationBroker", () => {
++  it.each<MicroControlAction>([
++    "dial-clockwise",
++    "dial-counterclockwise",
++    "dial-press",
++    "composer-toggle",
++    "new-thread",
++    "new-project",
++    "latest-message",
++    "settle-thread",
++    "terminal-toggle",
++    "command-palette",
++  ])("dispatches %s without revealing or focusing the window", async (action) => {
++    const activate = vi.fn();
++    const send = vi.fn();
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate });
++    broker.registerRenderer(send);
++
++    const response = broker.request({ ...microRequest, action });
++    expect(activate).not.toHaveBeenCalled();
++    expect(send).toHaveBeenCalledWith({ ...microRequest, action });
++    const success = { version: 1, requestId: microRequest.requestId, ok: true, action } as const;
++    broker.complete(success);
++    await expect(response).resolves.toEqual(success);
++    broker.close();
++  });
++
++  it("rejects Micro controls before renderer readiness without revealing the window", async () => {
++    const activate = vi.fn();
++    const send = vi.fn();
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate });
++
++    await expect(broker.request(microRequest)).resolves.toMatchObject({
++      requestId: microRequest.requestId,
++      ok: false,
++      code: "renderer-unavailable",
++    });
++    broker.registerRenderer(send);
++    expect(activate).not.toHaveBeenCalled();
++    expect(send).not.toHaveBeenCalled();
++    broker.close();
++  });
++
++  it("dispatches queued Micro actions in order and ignores a premature acknowledgement", async () => {
++    const send = vi.fn();
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
++    broker.registerRenderer(send);
++    const second = { ...microRequest, requestId: "micro-2", action: "dial-press" } as const;
++    const firstResponse = broker.request(microRequest);
++    const secondResponse = broker.request(second);
++    const secondSuccess = {
++      version: 1,
++      requestId: second.requestId,
++      ok: true,
++      action: second.action,
++    } as const;
++
++    broker.complete(secondSuccess);
++    expect(send).toHaveBeenCalledTimes(1);
++    broker.complete({
++      version: 1,
++      requestId: microRequest.requestId,
++      ok: true,
++      action: microRequest.action,
++    });
++    await expect(firstResponse).resolves.toMatchObject({ ok: true, action: "dial-clockwise" });
++    expect(send).toHaveBeenNthCalledWith(2, second);
++    broker.complete(secondSuccess);
++    await expect(secondResponse).resolves.toEqual(secondSuccess);
++    broker.close();
++  });
++
++  it.each<DesktopAppActivationResponse>([
++    { version: 1, requestId: microRequest.requestId, ok: true, action: "dial-press" },
++    {
++      version: 1,
++      requestId: microRequest.requestId,
++      ok: true,
++      projectId: ProjectId.make("project-1"),
++      threadId: ThreadId.make("thread-1"),
++    },
++  ])(
++    "rejects a Micro acknowledgement for a different action or request type",
++    async (completion) => {
++      const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
++      broker.registerRenderer(vi.fn());
++      const response = broker.request(microRequest);
++      broker.complete(completion);
++      await expect(response).resolves.toMatchObject({ ok: false, code: "internal-error" });
++      broker.close();
++    },
++  );
++
++  it("rejects a Micro acknowledgement for a workspace request", async () => {
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
++    broker.registerRenderer(vi.fn());
++    const response = broker.request(request);
++    broker.complete({ version: 1, requestId: request.requestId, ok: true, action: "dial-press" });
++    await expect(response).resolves.toMatchObject({ ok: false, code: "internal-error" });
++    broker.close();
++  });
++
++  it("drops queued Micro actions when the renderer goes away", async () => {
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
++    broker.registerRenderer(vi.fn());
++    const firstResponse = broker.request(microRequest);
++    const secondResponse = broker.request({ ...microRequest, requestId: "micro-2" });
++    broker.clearRenderer();
++    const send = vi.fn();
++    broker.registerRenderer(send);
++
++    await expect(firstResponse).resolves.toMatchObject({ ok: false, code: "renderer-unavailable" });
++    await expect(secondResponse).resolves.toMatchObject({
++      ok: false,
++      code: "renderer-unavailable",
++    });
++    expect(send).not.toHaveBeenCalled();
++    broker.close();
++  });
++
++  it("rejects Micro controls if sending to the renderer fails", async () => {
++    const broker = new DesktopAppActivationBroker({ requestTimeoutMs: 1_000, activate: vi.fn() });
++    broker.registerRenderer(() => {
++      throw new Error("Renderer closed.");
++    });
++    await expect(broker.request(microRequest)).resolves.toMatchObject({
++      ok: false,
++      code: "renderer-unavailable",
++    });
++    broker.close();
++  });
++
+   it("focuses immediately and waits for renderer readiness", async () => {
+     const activate = vi.fn();
+     const send = vi.fn();
+diff --git a/apps/desktop/src/app/DesktopAppActivationBroker.ts b/apps/desktop/src/app/DesktopAppActivationBroker.ts
+index 221df9ca..43e8b3a5 100644
+--- a/apps/desktop/src/app/DesktopAppActivationBroker.ts
++++ b/apps/desktop/src/app/DesktopAppActivationBroker.ts
+@@ -53,6 +53,11 @@ export class DesktopAppActivationBroker {
+         failure(request.requestId, "invalid-request", "The request id is already in use."),
+       );
+     }
++    if (request.type === "micro-control" && this.#renderer === null) {
++      return Promise.resolve(
++        failure(request.requestId, "renderer-unavailable", "The T3 Code window is not ready."),
++      );
++    }
+ 
+     const response = new Promise<DesktopAppActivationResponse>((resolve) => {
+       const timeout = setTimeout(() => {
+@@ -60,7 +65,7 @@ export class DesktopAppActivationBroker {
+           failure(
+             request.requestId,
+             "request-timeout",
+-            "The desktop app did not finish opening the project in time.",
++            "The desktop app did not finish the request in time.",
+           ),
+         );
+       }, this.#requestTimeoutMs);
+@@ -72,7 +77,7 @@ export class DesktopAppActivationBroker {
+       });
+     });
+ 
+-    this.#activate();
++    if (request.type !== "micro-control") this.#activate();
+     this.#flush();
+     return response;
+   }
+@@ -85,12 +90,12 @@ export class DesktopAppActivationBroker {
+   clearRenderer(): void {
+     this.#renderer = null;
+     for (const pending of this.#pending.values()) {
+-      if (pending.dispatched) {
++      if (pending.dispatched || pending.request.type === "micro-control") {
+         this.#settle(
+           failure(
+             pending.request.requestId,
+             "renderer-unavailable",
+-            "The T3 Code window closed before it opened the project.",
++            "The T3 Code window became unavailable before it completed the request.",
+           ),
+         );
+       }
+@@ -98,6 +103,23 @@ export class DesktopAppActivationBroker {
+   }
+ 
+   complete(response: DesktopAppActivationResponse): void {
++    const pending = this.#pending.get(response.requestId);
++    if (!pending?.dispatched) return;
++    if (
++      response.ok &&
++      (pending.request.type === "micro-control"
++        ? !("action" in response) || response.action !== pending.request.action
++        : "action" in response)
++    ) {
++      this.#settle(
++        failure(
++          response.requestId,
++          "internal-error",
++          "The renderer response did not match the request.",
++        ),
++      );
++      return;
++    }
+     this.#settle(response);
+   }
+ 
+@@ -129,7 +151,7 @@ export class DesktopAppActivationBroker {
+         renderer(pending.request);
+       } catch {
+         pending.dispatched = false;
+-        this.#renderer = null;
++        this.clearRenderer();
+       }
+       return;
+     }
+diff --git a/apps/server/integration/OrchestrationEngineHarness.integration.ts b/apps/server/integration/OrchestrationEngineHarness.integration.ts
+index 1c035d5f..8bc8704b 100644
+--- a/apps/server/integration/OrchestrationEngineHarness.integration.ts
++++ b/apps/server/integration/OrchestrationEngineHarness.integration.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "../src/project/WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "../src/project/ProjectSettleScriptRunner.testing.ts";
+ // @effect-diagnostics nodeBuiltinImport:off
+ import * as NodeChildProcess from "node:child_process";
+ 
+@@ -272,6 +274,8 @@ export const makeOrchestrationIntegrationHarness = (
+ 
+     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+     const orchestrationLayer = OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+       Layer.provide(OrchestrationProjectionPipelineLive),
+       Layer.provide(OrchestrationEventStoreLive),
+       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+@@ -290,6 +294,7 @@ export const makeOrchestrationIntegrationHarness = (
+       }),
+     ).pipe(
+       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
++      Layer.provideMerge(WorktreeOperationGuard.layer),
+       Layer.provideMerge(NodeServices.layer),
+       Layer.provideMerge(providerSessionDirectoryLayer),
+     );
+@@ -422,6 +427,7 @@ export const makeOrchestrationIntegrationHarness = (
+       Layer.provideMerge(RepositoryIdentityResolver.layer),
+       Layer.provideMerge(ServerSettingsService.layerTest()),
+       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
++      Layer.provideMerge(WorktreeOperationGuard.layer),
+       Layer.provideMerge(NodeServices.layer),
+       Layer.provideMerge(
+         options?.tracer ? Layer.succeed(Tracer.Tracer, options.tracer) : Layer.empty,
+diff --git a/apps/server/src/cli/app.test.ts b/apps/server/src/cli/app.test.ts
+index 0dddca4b..6d468e94 100644
+--- a/apps/server/src/cli/app.test.ts
++++ b/apps/server/src/cli/app.test.ts
+@@ -198,11 +198,16 @@ describe("t3 app", () => {
+         yield* runCli(["app"], { T3CODE_HOME: baseDir });
+         yield* runCli(["app", explicitPath, "--base-dir", baseDir]);
+ 
+-        expect(desktop.received.map((request) => request.workspaceRoot)).toEqual([
+-          workingDirectory,
+-          explicitPath,
+-        ]);
+-        expect(desktop.received.every((request) => request.platform === platform)).toBe(true);
++        expect(
++          desktop.received.map((request) =>
++            request.type === "open-workspace" ? request.workspaceRoot : undefined,
++          ),
++        ).toEqual([workingDirectory, explicitPath]);
++        expect(
++          desktop.received.every(
++            (request) => request.type === "open-workspace" && request.platform === platform,
++          ),
++        ).toBe(true);
+       }).pipe(Effect.scoped),
+     ),
+   );
+@@ -256,6 +261,29 @@ describe("t3 app", () => {
+     ),
+   );
+ 
++  it.effect("rejects a Micro acknowledgement for an open-workspace request", () =>
++    withTempDirectory("t3-app-wrong-action-", (root) =>
++      Effect.gen(function* () {
++        const baseDir = NodePath.join(root, "t3-home");
++        yield* fakeDesktop({
++          baseDir,
++          reply: (request) => ({
++            version: 1,
++            requestId: request.requestId,
++            ok: true,
++            action: "dial-press",
++          }),
++        });
++
++        const error = yield* runCli(["app", "--base-dir", baseDir]).pipe(Effect.flip);
++        expect(error).toMatchObject({
++          _tag: "DesktopAppUnreachableError",
++          cause: { message: "The desktop app response did not match this request." },
++        });
++      }).pipe(Effect.scoped),
++    ),
++  );
++
+   for (const responseKind of ["failure", "invalid"] as const) {
+     it.effect(`never falls back after the default desktop sends a ${responseKind} response`, () =>
+       withTempDirectory("t3-app-response-test-", (root) =>
+diff --git a/apps/server/src/cli/app.ts b/apps/server/src/cli/app.ts
+index 85fbebd7..07e0854f 100644
+--- a/apps/server/src/cli/app.ts
++++ b/apps/server/src/cli/app.ts
+@@ -141,7 +141,13 @@ export function sendDesktopAppActivationRequest(input: {
+         finish({ type: "failure", error: new Error("The desktop app response is invalid.") });
+         return;
+       }
+-      if (parsed.requestId !== input.request.requestId) {
++      if (
++        parsed.requestId !== input.request.requestId ||
++        (parsed.ok &&
++          (input.request.type === "micro-control"
++            ? !("action" in parsed) || parsed.action !== input.request.action
++            : "action" in parsed))
++      ) {
+         finish({
+           type: "failure",
+           error: new Error("The desktop app response did not match this request."),
+diff --git a/apps/server/src/git/GitManager.test.ts b/apps/server/src/git/GitManager.test.ts
+index 999a0c20..1c09245f 100644
+--- a/apps/server/src/git/GitManager.test.ts
++++ b/apps/server/src/git/GitManager.test.ts
+@@ -41,6 +41,7 @@ import type { SourceControlProvider } from "../sourceControl/SourceControlProvid
+ import * as SourceControlProviderRegistry from "../sourceControl/SourceControlProviderRegistry.ts";
+ import * as ServerConfig from "../config.ts";
+ import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
++import * as WorktreeOperationGuard from "../project/WorktreeOperationGuard.ts";
+ import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+ import * as GitManager from "./GitManager.ts";
+@@ -630,6 +631,7 @@ function makeManager(input?: {
+   textGeneration?: Partial<FakeGitTextGeneration>;
+   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
+   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
++  worktreeGuard?: WorktreeOperationGuard.WorktreeOperationGuard["Service"];
+   gitConfigReads?: string[];
+ }) {
+   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
+@@ -683,6 +685,9 @@ function makeManager(input?: {
+   );
+ 
+   const managerLayer = Layer.mergeAll(
++    input?.worktreeGuard
++      ? Layer.succeed(WorktreeOperationGuard.WorktreeOperationGuard, input.worktreeGuard)
++      : WorktreeOperationGuard.layer,
+     Layer.succeed(TextGeneration.TextGeneration, textGeneration),
+     Layer.mock(ProviderRegistry.ProviderRegistry)({
+       getProviders: Effect.succeed([]),
+@@ -4788,59 +4793,79 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
+     }),
+   );
+ 
+-  it.effect("reuses an existing dedicated worktree for the PR head branch", () =>
+-    Effect.gen(function* () {
+-      const repoDir = yield* makeTempDir("t3code-git-manager-");
+-      yield* initRepo(repoDir);
+-      yield* runGit(repoDir, ["checkout", "-b", "feature/pr-existing-worktree"]);
+-      NodeFS.writeFileSync(NodePath.join(repoDir, "existing.txt"), "existing\n");
+-      yield* runGit(repoDir, ["add", "existing.txt"]);
+-      yield* runGit(repoDir, ["commit", "-m", "Existing worktree branch"]);
+-      yield* runGit(repoDir, ["checkout", "main"]);
+-      const worktreePath = NodePath.join(
+-        repoDir,
+-        "..",
+-        `pr-existing-${NodePath.basename(repoDir)}`,
+-      );
+-      yield* runGit(repoDir, ["worktree", "add", worktreePath, "feature/pr-existing-worktree"]);
++  it.effect(
++    "reuses an existing dedicated PR worktree only after cleanup releases the checkout",
++    () =>
++      Effect.gen(function* () {
++        const repoDir = yield* makeTempDir("t3code-git-manager-");
++        yield* initRepo(repoDir);
++        yield* runGit(repoDir, ["checkout", "-b", "feature/pr-existing-worktree"]);
++        NodeFS.writeFileSync(NodePath.join(repoDir, "existing.txt"), "existing\n");
++        yield* runGit(repoDir, ["add", "existing.txt"]);
++        yield* runGit(repoDir, ["commit", "-m", "Existing worktree branch"]);
++        yield* runGit(repoDir, ["checkout", "main"]);
++        const worktreePath = NodePath.join(
++          repoDir,
++          "..",
++          `pr-existing-${NodePath.basename(repoDir)}`,
++        );
++        yield* runGit(repoDir, ["worktree", "add", worktreePath, "feature/pr-existing-worktree"]);
+ 
+-      const setupCalls: ProjectSetupScriptRunner.ProjectSetupScriptRunnerInput[] = [];
+-      const { manager } = yield* makeManager({
+-        ghScenario: {
+-          pullRequest: {
+-            number: 78,
+-            title: "Existing worktree PR",
+-            url: "https://github.com/pingdotgg/codething-mvp/pull/78",
+-            baseRefName: "main",
+-            headRefName: "feature/pr-existing-worktree",
+-            state: "open",
++        const worktreeGuard = yield* WorktreeOperationGuard.make;
++        const setupCalls: ProjectSetupScriptRunner.ProjectSetupScriptRunnerInput[] = [];
++        const { manager } = yield* makeManager({
++          worktreeGuard,
++          ghScenario: {
++            pullRequest: {
++              number: 78,
++              title: "Existing worktree PR",
++              url: "https://github.com/pingdotgg/codething-mvp/pull/78",
++              baseRefName: "main",
++              headRefName: "feature/pr-existing-worktree",
++              state: "open",
++            },
+           },
+-        },
+-        setupScriptRunner: {
+-          runForThread: (setupInput) =>
+-            Effect.sync(() => {
+-              setupCalls.push(setupInput);
+-              return { status: "no-script" as const };
+-            }),
+-        },
+-      });
++          setupScriptRunner: {
++            runForThread: (setupInput) =>
++              Effect.sync(() => {
++                setupCalls.push(setupInput);
++                return { status: "no-script" as const };
++              }),
++          },
++        });
+ 
+-      const result = yield* preparePullRequestThread(manager, {
+-        cwd: repoDir,
+-        reference: "78",
+-        mode: "worktree",
+-        threadId: asThreadId("thread-pr-existing-worktree"),
+-      });
++        const releaseCleanup = yield* worktreeGuard.tryAcquireCleanup(worktreePath);
++        const headBefore = (yield* runGit(worktreePath, ["rev-parse", "HEAD"])).stdout;
++        const blocked = yield* preparePullRequestThread(manager, {
++          cwd: repoDir,
++          reference: "78",
++          mode: "worktree",
++          threadId: asThreadId("thread-pr-existing-worktree"),
++        }).pipe(Effect.flip);
++        expect(blocked).toMatchObject({
++          _tag: "GitManagerError",
++          detail: expect.stringContaining("manual settle action"),
++        });
++        expect(setupCalls).toHaveLength(0);
++        expect((yield* runGit(worktreePath, ["rev-parse", "HEAD"])).stdout).toBe(headBefore);
++        releaseCleanup!();
+ 
+-      expect(result.worktreePath && NodeFS.realpathSync.native(result.worktreePath)).toBe(
+-        NodeFS.realpathSync.native(worktreePath),
+-      );
+-      expect(result.branch).toBe("feature/pr-existing-worktree");
+-      // Nothing to fetch from, so the checkout keeps the commit it had and setup stays out of a
+-      // worktree another thread may be sitting in.
+-      expect(setupCalls).toHaveLength(0);
+-      expect(result.isOnPullRequestHead).toBe(false);
+-    }),
++        const result = yield* preparePullRequestThread(manager, {
++          cwd: repoDir,
++          reference: "78",
++          mode: "worktree",
++          threadId: asThreadId("thread-pr-existing-worktree"),
++        });
++
++        expect(result.worktreePath && NodeFS.realpathSync.native(result.worktreePath)).toBe(
++          NodeFS.realpathSync.native(worktreePath),
++        );
++        expect(result.branch).toBe("feature/pr-existing-worktree");
++        // Nothing to fetch from, so the checkout keeps the commit it had and setup stays out of a
++        // worktree another thread may be sitting in.
++        expect(setupCalls).toHaveLength(0);
++        expect(result.isOnPullRequestHead).toBe(false);
++      }),
+   );
+ 
+   it.effect("refreshes a reused PR worktree onto the updated pull request head", () =>
+diff --git a/apps/server/src/git/GitManager.ts b/apps/server/src/git/GitManager.ts
+index f60eb278..3ea69e82 100644
+--- a/apps/server/src/git/GitManager.ts
++++ b/apps/server/src/git/GitManager.ts
+@@ -54,6 +54,7 @@ import {
+   repositoryConventionsTextGenerationPolicy,
+ } from "../textGeneration/TextGenerationPresets.ts";
+ import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
++import { WorktreeOperationGuard } from "../project/WorktreeOperationGuard.ts";
+ import * as ProviderRegistry from "../provider/Services/ProviderRegistry.ts";
+ import { extractBranchNameFromRemoteRef } from "./remoteRefs.ts";
+ import * as ServerSettings from "../serverSettings.ts";
+@@ -650,6 +651,7 @@ function toPullRequestHeadRemoteInfo(pr: {
+ }
+ 
+ export const make = Effect.gen(function* () {
++  const worktreeOperations = yield* WorktreeOperationGuard;
+   const gitCore = yield* GitVcsDriver.GitVcsDriver;
+   const sourceControlProviders = yield* SourceControlProviderRegistry.SourceControlProviderRegistry;
+   const textGeneration = yield* TextGeneration.TextGeneration;
+@@ -2314,96 +2316,108 @@ export const make = Effect.gen(function* () {
+       // advance the checkout from inside the worktree. A worktree that cannot be
+       // moved (no reachable head, local commits, dirty tree) is still handed
+       // back, because stranding the thread is worse than reporting the staleness.
+-      const reuseExistingWorktree = Effect.fn("reuseExistingWorktree")(function* (
+-        worktreePath: string,
+-        checkedOutBranch: string,
+-      ) {
+-        if (checkedOutBranch !== localPullRequestBranch) {
+-          // findLocalHeadBranch also accepts a branch that merely shares the head's bare name —
+-          // a fork PR opened from "main" matches the user's own local main. That checkout is
+-          // somebody else's work, so it keeps its tracking config and nothing else.
+-          yield* ensureExistingWorktreeUpstream(worktreePath);
+-          return {
+-            pullRequest,
+-            branch: localPullRequestBranch,
+-            worktreePath,
+-            isOnPullRequestHead: false,
+-          };
+-        }
++      const reuseExistingWorktree = Effect.fn("reuseExistingWorktree")(
++        function* (worktreePath: string, checkedOutBranch: string) {
++          if (checkedOutBranch !== localPullRequestBranch) {
++            // findLocalHeadBranch also accepts a branch that merely shares the head's bare name —
++            // a fork PR opened from "main" matches the user's own local main. That checkout is
++            // somebody else's work, so it keeps its tracking config and nothing else.
++            yield* ensureExistingWorktreeUpstream(worktreePath);
++            return {
++              pullRequest,
++              branch: localPullRequestBranch,
++              worktreePath,
++              isOnPullRequestHead: false,
++            };
++          }
+ 
+-        // Read before ensureExistingWorktreeUpstream: it force-updates the remote-tracking ref,
+-        // and once that has jumped to a rewritten head there is no way left to tell a checkout
+-        // that holds nothing of its own from one carrying local commits.
+-        const upstreamCommitBeforeFetch = yield* gitCore
+-          .resolveCommit({ cwd: worktreePath, revision: "@{upstream}" })
+-          .pipe(
+-            Effect.map((resolved) => resolved.commitSha),
+-            Effect.orElseSucceed(() => null),
+-          );
++          // Read before ensureExistingWorktreeUpstream: it force-updates the remote-tracking ref,
++          // and once that has jumped to a rewritten head there is no way left to tell a checkout
++          // that holds nothing of its own from one carrying local commits.
++          const upstreamCommitBeforeFetch = yield* gitCore
++            .resolveCommit({ cwd: worktreePath, revision: "@{upstream}" })
++            .pipe(
++              Effect.map((resolved) => resolved.commitSha),
++              Effect.orElseSucceed(() => null),
++            );
+ 
+-        yield* ensureExistingWorktreeUpstream(worktreePath);
++          yield* ensureExistingWorktreeUpstream(worktreePath);
+ 
+-        const refreshed = yield* gitCore
+-          // The pull request's own ref, because it is the only thing that certainly names its
+-          // head. The branch's upstream does not: configuring it is best-effort, so a branch cut
+-          // from `origin/main` whose head branch has since been deleted still resolves — and
+-          // following it would move the checkout onto main and call that the pull request.
+-          .fetchPullRequestHeadCommit({ cwd: worktreePath, prNumber: pullRequest.number })
+-          .pipe(
+-            // A host that publishes no `refs/pull/<n>/head` leaves the remote-tracking branch,
+-            // taken only where it is the head branch's own rather than whatever the checkout
+-            // happened to be cut from.
+-            Effect.catch(() =>
+-              Effect.gen(function* () {
+-                const details = yield* gitCore.statusDetails(worktreePath);
+-                if (
+-                  details.upstreamRef === null ||
+-                  !details.upstreamRef.endsWith(`/${pullRequest.headBranch}`)
+-                ) {
+-                  return yield* new GitManagerError({
+-                    operation: "preparePullRequestThread",
++          const refreshed = yield* gitCore
++            // The pull request's own ref, because it is the only thing that certainly names its
++            // head. The branch's upstream does not: configuring it is best-effort, so a branch cut
++            // from `origin/main` whose head branch has since been deleted still resolves — and
++            // following it would move the checkout onto main and call that the pull request.
++            .fetchPullRequestHeadCommit({ cwd: worktreePath, prNumber: pullRequest.number })
++            .pipe(
++              // A host that publishes no `refs/pull/<n>/head` leaves the remote-tracking branch,
++              // taken only where it is the head branch's own rather than whatever the checkout
++              // happened to be cut from.
++              Effect.catch(() =>
++                Effect.gen(function* () {
++                  const details = yield* gitCore.statusDetails(worktreePath);
++                  if (
++                    details.upstreamRef === null ||
++                    !details.upstreamRef.endsWith(`/${pullRequest.headBranch}`)
++                  ) {
++                    return yield* new GitManagerError({
++                      operation: "preparePullRequestThread",
++                      cwd: worktreePath,
++                      detail: "The pull request head could not be resolved for this checkout.",
++                    });
++                  }
++                  return yield* gitCore.resolveCommit({
+                     cwd: worktreePath,
+-                    detail: "The pull request head could not be resolved for this checkout.",
++                    revision: details.upstreamRef,
+                   });
+-                }
+-                return yield* gitCore.resolveCommit({
++                }),
++              ),
++              Effect.flatMap((target) =>
++                gitCore.refreshCheckedOutBranch({
+                   cwd: worktreePath,
+-                  revision: details.upstreamRef,
+-                });
+-              }),
+-            ),
+-            Effect.flatMap((target) =>
+-              gitCore.refreshCheckedOutBranch({
+-                cwd: worktreePath,
+-                targetCommit: target.commitSha,
+-                resetWhenHeadCommit: upstreamCommitBeforeFetch,
+-              }),
+-            ),
+-            Effect.catch((error) =>
+-              Effect.logWarning(
+-                "GitManager.preparePullRequestThread reused worktree refresh failed",
+-                {
+-                  worktreePath,
+-                  localBranch: localPullRequestBranch,
+-                  cause: error,
+-                },
+-              ).pipe(Effect.as({ moved: false, onTarget: false })),
+-            ),
+-          );
++                  targetCommit: target.commitSha,
++                  resetWhenHeadCommit: upstreamCommitBeforeFetch,
++                }),
++              ),
++              Effect.catch((error) =>
++                Effect.logWarning(
++                  "GitManager.preparePullRequestThread reused worktree refresh failed",
++                  {
++                    worktreePath,
++                    localBranch: localPullRequestBranch,
++                    cause: error,
++                  },
++                ).pipe(Effect.as({ moved: false, onTarget: false })),
++              ),
++            );
+ 
+-        // Only when the checkout actually moved: another thread may be running in this worktree,
+-        // and re-running the setup script under it buys nothing when the code did not change.
+-        if (refreshed.moved) {
+-          yield* maybeRunSetupScript(worktreePath);
+-        }
++          // Only when the checkout actually moved: another thread may be running in this worktree,
++          // and re-running the setup script under it buys nothing when the code did not change.
++          if (refreshed.moved) {
++            yield* maybeRunSetupScript(worktreePath);
++          }
+ 
+-        return {
+-          pullRequest,
+-          branch: localPullRequestBranch,
+-          worktreePath,
+-          isOnPullRequestHead: refreshed.onTarget,
+-        };
+-      });
++          return {
++            pullRequest,
++            branch: localPullRequestBranch,
++            worktreePath,
++            isOnPullRequestHead: refreshed.onTarget,
++          };
++        },
++        (effect, worktreePath) =>
++          worktreeOperations.withMutation([worktreePath], effect).pipe(
++            Effect.catchTag(
++              "WorktreeCleanupBusyError",
++              (cause) =>
++                new GitManagerError({
++                  operation: "preparePullRequestThread",
++                  cwd: worktreePath,
++                  detail: cause.message,
++                  cause,
++                }),
++            ),
++          ),
++      );
+ 
+       const findLocalHeadBranch = Effect.fn("findLocalHeadBranch")(function* (cwd: string) {
+         const result = yield* gitCore.listRefs({ cwd, refresh: true });
+@@ -2495,7 +2509,20 @@ export const make = Effect.gen(function* () {
+         worktreePath: worktree.worktree.path,
+         isOnPullRequestHead: true,
+       };
+-    }).pipe(Effect.ensuring(invalidateStatus(input.cwd)));
++    }).pipe(
++      (effect) => worktreeOperations.withMutation([input.cwd], effect),
++      Effect.catchTag(
++        "WorktreeCleanupBusyError",
++        (cause) =>
++          new GitManagerError({
++            operation: "preparePullRequestThread",
++            cwd: input.cwd,
++            detail: cause.message,
++            cause,
++          }),
++      ),
++      Effect.ensuring(invalidateStatus(input.cwd)),
++    );
+   });
+ 
+   const runFeatureBranchStep = Effect.fn("runFeatureBranchStep")(function* (
+diff --git a/apps/server/src/git/GitWorkflowService.test.ts b/apps/server/src/git/GitWorkflowService.test.ts
+index 2ea14b95..01f277e6 100644
+--- a/apps/server/src/git/GitWorkflowService.test.ts
++++ b/apps/server/src/git/GitWorkflowService.test.ts
+@@ -1,6 +1,10 @@
+ import { assert, describe, expect, it, vi } from "@effect/vitest";
+ import * as Effect from "effect/Effect";
+ import * as Layer from "effect/Layer";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
++import * as DateTime from "effect/DateTime";
++import * as Option from "effect/Option";
+ 
+ import { VcsRepositoryDetectionError } from "@t3tools/contracts";
+ 
+@@ -8,11 +12,19 @@ import * as GitManager from "./GitManager.ts";
+ import * as GitWorkflowService from "./GitWorkflowService.ts";
+ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
++import * as WorktreeOperationGuard from "../project/WorktreeOperationGuard.ts";
++import * as VcsDriver from "../vcs/VcsDriver.ts";
++
++const worktreeGuardLayer = WorktreeOperationGuard.layer.pipe(
++  Layer.provide(FileSystem.layerNoop({ realPath: (cwd) => Effect.succeed(cwd) })),
++  Layer.provide(Path.layer),
++);
+ 
+ function makeLayer(input: {
+   readonly detect: VcsDriverRegistry.VcsDriverRegistry["Service"]["detect"];
+ }) {
+   return GitWorkflowService.layer.pipe(
++    Layer.provide(worktreeGuardLayer),
+     Layer.provide(
+       Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+         detect: input.detect,
+@@ -24,6 +36,87 @@ function makeLayer(input: {
+ }
+ 
+ describe("GitWorkflowService", () => {
++  it.effect("worktree removal and creation reject cleanup ownership before invoking Git", () => {
++    const removed: string[] = [];
++    const registryLayer = Layer.effect(
++      VcsDriverRegistry.VcsDriverRegistry,
++      Effect.gen(function* () {
++        const driver = yield* VcsDriver.VcsDriver;
++        return VcsDriverRegistry.VcsDriverRegistry.of({
++          get: () => Effect.succeed(driver),
++          detect: () => Effect.succeed(null),
++          resolve: ({ cwd }) =>
++            Effect.gen(function* () {
++              return {
++                kind: "git" as const,
++                driver,
++                repository: {
++                  kind: "git" as const,
++                  rootPath: cwd,
++                  metadataPath: null,
++                  freshness: {
++                    source: "live-local" as const,
++                    observedAt: yield* DateTime.now,
++                    expiresAt: Option.none(),
++                  },
++                },
++              };
++            }),
++        });
++      }),
++    ).pipe(
++      Layer.provide(
++        Layer.mock(VcsDriver.VcsDriver)({
++          capabilities: {
++            kind: "git",
++            supportsWorktrees: true,
++            supportsBookmarks: false,
++            supportsAtomicSnapshot: false,
++            supportsPushDefaultRemote: true,
++            ignoreClassifier: "git-compatible-fallback",
++          },
++        }),
++      ),
++    );
++    const mutationLayer = GitWorkflowService.layer.pipe(
++      Layer.provide(registryLayer),
++      Layer.provide(
++        Layer.mock(GitVcsDriver.GitVcsDriver)({
++          removeWorktree: ({ path }) =>
++            Effect.sync(() => {
++              removed.push(path);
++            }),
++        }),
++      ),
++      Layer.provide(Layer.mock(GitManager.GitManager)({})),
++      Layer.provideMerge(worktreeGuardLayer),
++    );
++    return Effect.gen(function* () {
++      const guard = yield* WorktreeOperationGuard.WorktreeOperationGuard;
++      const workflow = yield* GitWorkflowService.GitWorkflowService;
++      const release = yield* guard.tryAcquireCleanup("/repo/task");
++      const removeError = yield* workflow
++        .removeWorktree({ cwd: "/repo", path: "/repo/task", force: true })
++        .pipe(Effect.flip);
++      expect(removeError).toMatchObject({
++        _tag: "GitCommandError",
++        detail: expect.stringContaining("manual settle action"),
++      });
++      const createError = yield* workflow
++        .createWorktree({ cwd: "/repo", refName: "main", path: "/repo/task" })
++        .pipe(Effect.flip);
++      expect(createError).toMatchObject({
++        _tag: "GitCommandError",
++        detail: expect.stringContaining("manual settle action"),
++      });
++      expect(removed).toEqual([]);
++      yield* workflow.removeWorktree({ cwd: "/repo", path: "/repo/unrelated", force: true });
++      release!();
++      yield* workflow.removeWorktree({ cwd: "/repo", path: "/repo/task", force: true });
++      expect(removed).toEqual(["/repo/unrelated", "/repo/task"]);
++    }).pipe(Effect.provide(mutationLayer));
++  });
++
+   it.effect("returns an empty local status when no VCS repository is detected", () =>
+     Effect.gen(function* () {
+       const workflow = yield* GitWorkflowService.GitWorkflowService;
+@@ -87,6 +180,7 @@ describe("GitWorkflowService", () => {
+     const status = vi.fn();
+ 
+     const testLayer = GitWorkflowService.layer.pipe(
++      Layer.provide(worktreeGuardLayer),
+       Layer.provide(
+         Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+           detect: () => Effect.succeed(null),
+diff --git a/apps/server/src/git/GitWorkflowService.ts b/apps/server/src/git/GitWorkflowService.ts
+index c9b4a4cc..6726f3a7 100644
+--- a/apps/server/src/git/GitWorkflowService.ts
++++ b/apps/server/src/git/GitWorkflowService.ts
+@@ -31,6 +31,7 @@ import {
+ import * as GitManager from "./GitManager.ts";
+ import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
+ import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
++import { WorktreeOperationGuard } from "../project/WorktreeOperationGuard.ts";
+ 
+ export class GitWorkflowService extends Context.Service<
+   GitWorkflowService,
+@@ -143,6 +144,7 @@ function nonRepositoryListRefs(): VcsListRefsResult {
+ }
+ 
+ export const make = Effect.gen(function* () {
++  const worktreeOperations = yield* WorktreeOperationGuard;
+   const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
+   const git = yield* GitVcsDriver.GitVcsDriver;
+   const gitManager = yield* GitManager.GitManager;
+@@ -308,9 +310,26 @@ export const make = Effect.gen(function* () {
+         ),
+       ),
+     createWorktree: (input) =>
+-      ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
+-        Effect.andThen(git.createWorktree(input)),
+-      ),
++      worktreeOperations
++        .withMutation(
++          [input.cwd, ...(input.path ? [input.path] : [])],
++          ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
++            Effect.andThen(git.createWorktree(input)),
++          ),
++        )
++        .pipe(
++          Effect.catchTag(
++            "WorktreeCleanupBusyError",
++            (cause) =>
++              new GitCommandError({
++                operation: "GitWorkflowService.createWorktree",
++                command: "worktree add",
++                cwd: input.cwd,
++                detail: cause.message,
++                cause,
++              }),
++          ),
++        ),
+     fetchRemote: (input) =>
+       ensureGitCommand("GitWorkflowService.fetchRemote", input.cwd).pipe(
+         Effect.andThen(git.fetchRemote(input)),
+@@ -328,9 +347,26 @@ export const make = Effect.gen(function* () {
+         Effect.andThen(git.resolveRemoteTrackingCommit(input)),
+       ),
+     removeWorktree: (input) =>
+-      ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
+-        Effect.andThen(git.removeWorktree(input)),
+-      ),
++      worktreeOperations
++        .withMutation(
++          [input.path],
++          ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
++            Effect.andThen(git.removeWorktree(input)),
++          ),
++        )
++        .pipe(
++          Effect.catchTag(
++            "WorktreeCleanupBusyError",
++            (cause) =>
++              new GitCommandError({
++                operation: "GitWorkflowService.removeWorktree",
++                command: "worktree remove",
++                cwd: input.cwd,
++                detail: cause.message,
++                cause,
++              }),
++          ),
++        ),
+     pruneWorktrees: (input) =>
+       ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
+         Effect.andThen(git.pruneWorktrees(input)),
+diff --git a/apps/server/src/orchestration/Layers/CheckpointReactor.test.ts b/apps/server/src/orchestration/Layers/CheckpointReactor.test.ts
+index 9e141600..86887c7d 100644
+--- a/apps/server/src/orchestration/Layers/CheckpointReactor.test.ts
++++ b/apps/server/src/orchestration/Layers/CheckpointReactor.test.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "../../project/WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "../../project/ProjectSettleScriptRunner.testing.ts";
+ // @effect-diagnostics nodeBuiltinImport:off
+ import * as NodeFS from "node:fs";
+ import * as NodeOS from "node:os";
+@@ -316,6 +318,8 @@ describe("CheckpointReactor", () => {
+       options?.providerName ?? ProviderDriverKind.make("codex"),
+     );
+     const orchestrationLayer = OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+       Layer.provide(ThreadBackgroundLiveness.layer),
+       Layer.provide(ThreadPlanProgress.layer),
+@@ -363,6 +367,7 @@ describe("CheckpointReactor", () => {
+     });
+ 
+     const layer = CheckpointReactorLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
+       Layer.provideMerge(orchestrationLayer),
+       Layer.provideMerge(projectionSnapshotLayer),
+       Layer.provideMerge(RuntimeReceiptBusTest),
+diff --git a/apps/server/src/orchestration/Layers/CheckpointReactor.ts b/apps/server/src/orchestration/Layers/CheckpointReactor.ts
+index eb773481..8d6a1b6d 100644
+--- a/apps/server/src/orchestration/Layers/CheckpointReactor.ts
++++ b/apps/server/src/orchestration/Layers/CheckpointReactor.ts
+@@ -38,6 +38,7 @@ import type { OrchestrationDispatchError } from "../Errors.ts";
+ import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
+ import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
+ import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
++import { WorktreeOperationGuard } from "../../project/WorktreeOperationGuard.ts";
+ 
+ const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+ 
+@@ -76,6 +77,7 @@ function checkpointStatusFromRuntime(status: string | undefined): "ready" | "mis
+ }
+ 
+ const make = Effect.gen(function* () {
++  const worktreeOperations = yield* WorktreeOperationGuard;
+   const crypto = yield* Crypto.Crypto;
+   const randomUUID = crypto.randomUUIDv4;
+   const serverEventId = randomUUID.pipe(Effect.map(EventId.make));
+@@ -752,68 +754,73 @@ const make = Effect.gen(function* () {
+       return;
+     }
+ 
+-    yield* providerService.assertConversationRollbackSupported(event.payload.threadId);
++    return yield* worktreeOperations.withMutation(
++      [sessionRuntime.value.cwd],
++      Effect.gen(function* () {
++        yield* providerService.assertConversationRollbackSupported(event.payload.threadId);
+ 
+-    const restored = yield* checkpointStore.restoreCheckpoint({
+-      cwd: sessionRuntime.value.cwd,
+-      checkpointRef: targetCheckpointRef,
+-      fallbackToHead: event.payload.turnCount === 0,
+-    });
+-    if (!restored) {
+-      yield* appendRevertFailureActivity({
+-        threadId: event.payload.threadId,
+-        turnCount: event.payload.turnCount,
+-        detail: `Filesystem checkpoint is unavailable for turn ${event.payload.turnCount}.`,
+-        createdAt: now,
+-      }).pipe(Effect.catch(() => Effect.void));
+-      return;
+-    }
++        const restored = yield* checkpointStore.restoreCheckpoint({
++          cwd: sessionRuntime.value.cwd,
++          checkpointRef: targetCheckpointRef,
++          fallbackToHead: event.payload.turnCount === 0,
++        });
++        if (!restored) {
++          yield* appendRevertFailureActivity({
++            threadId: event.payload.threadId,
++            turnCount: event.payload.turnCount,
++            detail: `Filesystem checkpoint is unavailable for turn ${event.payload.turnCount}.`,
++            createdAt: now,
++          }).pipe(Effect.catch(() => Effect.void));
++          return;
++        }
+ 
+-    // Refresh the workspace entry index so the @-mention file picker
+-    // reflects the reverted filesystem state.
+-    yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
+-
+-    const rolledBackTurns = Math.max(0, currentTurnCount - event.payload.turnCount);
+-    if (rolledBackTurns > 0) {
+-      yield* providerService.rollbackConversation({
+-        threadId: sessionRuntime.value.threadId,
+-        numTurns: rolledBackTurns,
+-      });
+-    }
++        // Refresh the workspace entry index so the @-mention file picker
++        // reflects the reverted filesystem state.
++        yield* workspaceEntries.refresh(sessionRuntime.value.cwd);
+ 
+-    const staleCheckpointRefs: Array<CheckpointRef> = [];
+-    for (const checkpoint of thread.checkpoints) {
+-      if (checkpoint.checkpointTurnCount > event.payload.turnCount) {
+-        staleCheckpointRefs.push(checkpoint.checkpointRef);
+-      }
+-    }
++        const rolledBackTurns = Math.max(0, currentTurnCount - event.payload.turnCount);
++        if (rolledBackTurns > 0) {
++          yield* providerService.rollbackConversation({
++            threadId: sessionRuntime.value.threadId,
++            numTurns: rolledBackTurns,
++          });
++        }
+ 
+-    if (staleCheckpointRefs.length > 0) {
+-      yield* checkpointStore.deleteCheckpointRefs({
+-        cwd: sessionRuntime.value.cwd,
+-        checkpointRefs: staleCheckpointRefs,
+-      });
+-    }
++        const staleCheckpointRefs: Array<CheckpointRef> = [];
++        for (const checkpoint of thread.checkpoints) {
++          if (checkpoint.checkpointTurnCount > event.payload.turnCount) {
++            staleCheckpointRefs.push(checkpoint.checkpointRef);
++          }
++        }
+ 
+-    yield* orchestrationEngine
+-      .dispatch({
+-        type: "thread.revert.complete",
+-        commandId: yield* serverCommandId("checkpoint-revert-complete"),
+-        threadId: event.payload.threadId,
+-        turnCount: event.payload.turnCount,
+-        createdAt: now,
+-      })
+-      .pipe(
+-        Effect.catch((error) =>
+-          appendRevertFailureActivity({
++        if (staleCheckpointRefs.length > 0) {
++          yield* checkpointStore.deleteCheckpointRefs({
++            cwd: sessionRuntime.value.cwd,
++            checkpointRefs: staleCheckpointRefs,
++          });
++        }
++
++        yield* orchestrationEngine
++          .dispatch({
++            type: "thread.revert.complete",
++            commandId: yield* serverCommandId("checkpoint-revert-complete"),
+             threadId: event.payload.threadId,
+             turnCount: event.payload.turnCount,
+-            detail: error.message,
+             createdAt: now,
+-          }),
+-        ),
+-        Effect.asVoid,
+-      );
++          })
++          .pipe(
++            Effect.catch((error) =>
++              appendRevertFailureActivity({
++                threadId: event.payload.threadId,
++                turnCount: event.payload.turnCount,
++                detail: error.message,
++                createdAt: now,
++              }),
++            ),
++            Effect.asVoid,
++          );
++      }),
++    );
+   });
+ 
+   const processDomainEvent = Effect.fn("processDomainEvent")(function* (event: OrchestrationEvent) {
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+index 0b2e08c4..98544bc4 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.test.ts
+@@ -1,3 +1,6 @@
++import * as WorktreeOperationGuard from "../../project/WorktreeOperationGuard.ts";
++import { ProjectSettleScriptRunner } from "../../project/ProjectSettleScriptRunner.ts";
++import { noProjectSettleScripts } from "../../project/ProjectSettleScriptRunner.testing.ts";
+ // @effect-diagnostics nodeBuiltinImport:off
+ import * as NodeFSP from "node:fs/promises";
+ import * as NodeOS from "node:os";
+@@ -27,7 +30,7 @@ import * as Option from "effect/Option";
+ import * as Queue from "effect/Queue";
+ import * as Stream from "effect/Stream";
+ import { TestClock } from "effect/testing";
+-import { describe, expect, it } from "vite-plus/test";
++import { describe, expect, it, vi } from "vite-plus/test";
+ 
+ import { PersistenceSqlError } from "../../persistence/Errors.ts";
+ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+@@ -60,7 +63,10 @@ const asMessageId = (value: string): MessageId => MessageId.make(value);
+ const asTurnId = (value: string): TurnId => TurnId.make(value);
+ const asCheckpointRef = (value: string): CheckpointRef => CheckpointRef.make(value);
+ 
+-function makeOrchestrationLayer(databasePath?: string) {
++function makeOrchestrationLayer(
++  databasePath?: string,
++  settleScripts: Layer.Layer<ProjectSettleScriptRunner> = noProjectSettleScripts,
++) {
+   const persistence = databasePath
+     ? makeSqlitePersistenceLive(databasePath)
+     : SqlitePersistenceMemory;
+@@ -69,6 +75,8 @@ function makeOrchestrationLayer(databasePath?: string) {
+   });
+   return Layer.mergeAll(
+     OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(settleScripts),
+       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+       Layer.provide(OrchestrationProjectionPipelineLive),
+     ),
+@@ -81,16 +89,24 @@ function makeOrchestrationLayer(databasePath?: string) {
+     Layer.provide(RepositoryIdentityResolver.layer),
+     Layer.provide(persistence),
+     Layer.provideMerge(ServerConfigLayer),
++    Layer.provideMerge(WorktreeOperationGuard.layer),
+     Layer.provideMerge(NodeServices.layer),
+   );
+ }
+ 
+-async function createOrchestrationSystem(databasePath?: string) {
+-  const runtime = ManagedRuntime.make(makeOrchestrationLayer(databasePath));
++async function createOrchestrationSystem(
++  databasePath?: string,
++  settleScripts?: Layer.Layer<ProjectSettleScriptRunner>,
++) {
++  const runtime = ManagedRuntime.make(makeOrchestrationLayer(databasePath, settleScripts));
+   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+   const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
++  const worktreeOperations = await runtime.runPromise(
++    Effect.service(WorktreeOperationGuard.WorktreeOperationGuard),
++  );
+   return {
+     engine,
++    worktreeOperations,
+     readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
+     readThread: (threadId: ThreadId) =>
+       runtime.runPromise(snapshotQuery.getThreadDetailById(threadId)),
+@@ -115,6 +131,349 @@ const hasMetricSnapshot = (
+   );
+ 
+ describe("OrchestrationEngine", () => {
++  it.each(["completed", "failed"] as const)(
++    "runs new manual settle hooks asynchronously and records %s",
++    async (resultKind) => {
++      const execute = vi.fn(() => Effect.succeed({ kind: resultKind, detail: "fixture result" }));
++      const prepare = vi.fn(() =>
++        Effect.succeed({
++          kind: "ready" as const,
++          scripts: [
++            {
++              id: "cleanup",
++              name: "Cleanup",
++              command: "fixture-only",
++              icon: "configure" as const,
++              runOnWorktreeCreate: false,
++              runOnThreadSettle: true,
++            },
++          ],
++          cwd: "/fixture/worktree",
++          env: {},
++        }),
++      );
++      const system = await createOrchestrationSystem(
++        undefined,
++        Layer.succeed(ProjectSettleScriptRunner, { prepare, execute }),
++      );
++      const projectId = ProjectId.make("settle-project");
++      const threadId = ThreadId.make("settle-thread");
++      try {
++        await system.run(
++          system.engine.dispatch({
++            type: "project.create",
++            commandId: CommandId.make("p"),
++            projectId,
++            title: "Project",
++            workspaceRoot: "/fixture",
++            createdAt: now(),
++          }),
++        );
++        await system.run(
++          system.engine.dispatch({
++            type: "thread.create",
++            commandId: CommandId.make("t"),
++            threadId,
++            projectId,
++            title: "Thread",
++            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++            runtimeMode: "full-access",
++            interactionMode: "default",
++            branch: "task",
++            worktreePath: "/fixture/worktree",
++            createdAt: now(),
++          }),
++        );
++        const settle = {
++          type: "thread.settle" as const,
++          commandId: CommandId.make("settle"),
++          threadId,
++        };
++        await system.run(system.engine.dispatch(settle));
++        await vi.waitFor(async () => {
++          const thread = Option.getOrThrow(await system.readThread(threadId));
++          expect(thread.settledOverride).toBe("settled");
++          expect(thread.activities.map((activity) => activity.kind)).toEqual([
++            "settle-script.started",
++            `settle-script.${resultKind}`,
++          ]);
++        });
++        await system.run(system.engine.dispatch(settle));
++        await system.run(
++          system.engine.dispatch({ ...settle, commandId: CommandId.make("settle-again") }),
++        );
++        expect(prepare).toHaveBeenCalledTimes(1);
++        expect(execute).toHaveBeenCalledTimes(1);
++      } finally {
++        await system.dispose();
++      }
++    },
++  );
++
++  it("keeps other threads responsive while rejecting reuse of a cleaning worktree", async () => {
++    let finishCleanup!: () => void;
++    const cleanupFinished = new Promise<void>((resolve) => {
++      finishCleanup = resolve;
++    });
++    const execute = vi.fn(() =>
++      Effect.promise(() => cleanupFinished).pipe(
++        Effect.as({ kind: "completed" as const, detail: "done" }),
++      ),
++    );
++    const system = await createOrchestrationSystem(
++      undefined,
++      Layer.succeed(ProjectSettleScriptRunner, {
++        prepare: () =>
++          Effect.succeed({
++            kind: "ready",
++            scripts: [
++              {
++                id: "cleanup",
++                name: "Cleanup",
++                command: "fixture",
++                icon: "configure",
++                runOnWorktreeCreate: false,
++                runOnThreadSettle: true,
++              },
++            ],
++            cwd: "/fixture/worktree",
++            env: {},
++          }),
++        execute,
++      }),
++    );
++    const projectId = ProjectId.make("p");
++    const threadId = ThreadId.make("cleaning");
++    const createThread = (id: string, cwd: string): OrchestrationCommand => ({
++      type: "thread.create",
++      commandId: CommandId.make(`create-${id}`),
++      threadId: ThreadId.make(id),
++      projectId,
++      title: id,
++      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++      runtimeMode: "full-access",
++      interactionMode: "default",
++      branch: "task",
++      worktreePath: cwd,
++      createdAt: now(),
++    });
++    try {
++      await system.run(
++        system.engine.dispatch({
++          type: "project.create",
++          commandId: CommandId.make("p"),
++          projectId,
++          title: "Project",
++          workspaceRoot: "/fixture",
++          createdAt: now(),
++        }),
++      );
++      await system.run(system.engine.dispatch(createThread("cleaning", "/fixture/worktree")));
++      await system.run(system.engine.dispatch(createThread("other", "/fixture/other")));
++      await system.run(
++        system.engine.dispatch({
++          type: "thread.settle",
++          commandId: CommandId.make("settle"),
++          threadId,
++        }),
++      );
++      await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
++      const dispatch = (command: OrchestrationCommand) =>
++        system.run(system.engine.dispatch(command));
++      await dispatch({
++        type: "thread.meta.update",
++        commandId: CommandId.make("other-title"),
++        threadId: ThreadId.make("other"),
++        title: "Still responsive",
++      });
++      const blocked: OrchestrationCommand[] = [
++        { type: "thread.unsettle", commandId: CommandId.make("resume"), threadId, reason: "user" },
++        {
++          type: "thread.turn.start",
++          commandId: CommandId.make("start"),
++          threadId,
++          message: { messageId: MessageId.make("m"), role: "user", text: "hello", attachments: [] },
++          runtimeMode: "full-access",
++          interactionMode: "default",
++          createdAt: now(),
++        },
++        createThread("new", "/fixture/worktree"),
++        {
++          type: "thread.meta.update",
++          commandId: CommandId.make("repoint"),
++          threadId: ThreadId.make("other"),
++          worktreePath: "/fixture/worktree",
++        },
++        { type: "thread.delete", commandId: CommandId.make("delete"), threadId },
++      ];
++      for (const command of blocked)
++        await expect(dispatch(command)).rejects.toThrow("manual settle action");
++      finishCleanup();
++      await vi.waitFor(async () =>
++        expect(
++          Option.getOrThrow(await system.readThread(threadId)).activities.some(
++            (a) => a.kind === "settle-script.completed",
++          ),
++        ).toBe(true),
++      );
++      await dispatch({
++        type: "thread.unsettle",
++        commandId: CommandId.make("resume-after"),
++        threadId,
++        reason: "user",
++      });
++    } finally {
++      finishCleanup();
++      await system.dispose();
++    }
++  });
++
++  it("skips cleanup when a checkout mutation already holds the shared reservation", async () => {
++    const execute = vi.fn(() => Effect.succeed({ kind: "completed" as const, detail: "done" }));
++    const system = await createOrchestrationSystem(
++      undefined,
++      Layer.succeed(ProjectSettleScriptRunner, {
++        prepare: () =>
++          Effect.succeed({
++            kind: "ready",
++            scripts: [
++              {
++                id: "cleanup",
++                name: "Cleanup",
++                command: "fixture",
++                icon: "configure",
++                runOnWorktreeCreate: false,
++              },
++            ],
++            cwd: "/fixture/worktree",
++            env: {},
++          }),
++        execute,
++      }),
++    );
++    const projectId = ProjectId.make("p");
++    const threadId = ThreadId.make("t");
++    try {
++      await system.run(
++        system.engine.dispatch({
++          type: "project.create",
++          commandId: CommandId.make("p"),
++          projectId,
++          title: "Project",
++          workspaceRoot: "/fixture",
++          createdAt: now(),
++        }),
++      );
++      await system.run(
++        system.engine.dispatch({
++          type: "thread.create",
++          commandId: CommandId.make("t"),
++          threadId,
++          projectId,
++          title: "Thread",
++          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++          runtimeMode: "full-access",
++          interactionMode: "default",
++          branch: "task",
++          worktreePath: "/fixture/worktree",
++          createdAt: now(),
++        }),
++      );
++      await system.run(
++        system.worktreeOperations.withMutation(
++          ["/fixture/worktree"],
++          system.engine.dispatch({
++            type: "thread.settle",
++            commandId: CommandId.make("settle"),
++            threadId,
++          }),
++        ),
++      );
++      await vi.waitFor(async () =>
++        expect(Option.getOrThrow(await system.readThread(threadId)).activities).toMatchObject([
++          {
++            kind: "settle-script.skipped",
++            payload: { detail: expect.stringContaining("checkout operation") },
++          },
++        ]),
++      );
++      expect(execute).not.toHaveBeenCalled();
++    } finally {
++      await system.dispose();
++    }
++  });
++
++  it("never prepares hooks for automatic settlement or imported history", async () => {
++    const prepare = vi.fn(() => Effect.succeed({ kind: "none" as const }));
++    const system = await createOrchestrationSystem(
++      undefined,
++      Layer.succeed(ProjectSettleScriptRunner, {
++        prepare,
++        execute: () => Effect.die("unexpected cleanup"),
++      }),
++    );
++    const projectId = ProjectId.make("p");
++    try {
++      await system.run(
++        system.engine.dispatch({
++          type: "project.create",
++          commandId: CommandId.make("p"),
++          projectId,
++          title: "Project",
++          workspaceRoot: "/fixture",
++          createdAt: now(),
++        }),
++      );
++      for (const id of ["auto", "import"]) {
++        const threadId = ThreadId.make(id);
++        await system.run(
++          system.engine.dispatch({
++            type: "thread.create",
++            commandId: CommandId.make(id),
++            threadId,
++            projectId,
++            title: id,
++            modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++            runtimeMode: "full-access",
++            interactionMode: "default",
++            branch: "task",
++            worktreePath: `/fixture/${id}`,
++            createdAt: now(),
++          }),
++        );
++        if (id === "auto")
++          await system.run(
++            system.engine.dispatch({
++              type: "thread.auto-settle",
++              commandId: CommandId.make("auto-settle"),
++              threadId,
++              snapshotSequence: await system.run(system.engine.latestSequence),
++              settledAt: now(),
++            }),
++          );
++        else
++          await system.run(
++            system.engine.dispatch({
++              type: "thread.history.import",
++              commandId: CommandId.make("import-history"),
++              threadId,
++              messages: [
++                {
++                  messageId: MessageId.make("imported"),
++                  role: "user",
++                  text: "historic",
++                  createdAt: now(),
++                },
++              ],
++            }),
++          );
++      }
++      expect(prepare).not.toHaveBeenCalled();
++    } finally {
++      await system.dispose();
++    }
++  });
++
+   it.each(["running", "stopped"] as const)(
+     "sends async answers with a %s session and rejects old duplicate replies",
+     async (status) => {
+@@ -389,6 +748,8 @@ describe("OrchestrationEngine", () => {
+     let fullSnapshotReadCount = 0;
+ 
+     const layer = OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+       Layer.provide(
+         Layer.succeed(ProjectionSnapshotQuery, {
+           getUserInputActivity: () => Effect.die("unused"),
+@@ -1460,6 +1821,8 @@ describe("OrchestrationEngine", () => {
+ 
+     const runtime = ManagedRuntime.make(
+       OrchestrationEngineLive.pipe(
++        Layer.provide(WorktreeOperationGuard.layer),
++        Layer.provide(noProjectSettleScripts),
+         Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+         Layer.provide(ThreadBackgroundLiveness.layer),
+         Layer.provide(ThreadPlanProgress.layer),
+@@ -1568,6 +1931,8 @@ describe("OrchestrationEngine", () => {
+ 
+     const runtime = ManagedRuntime.make(
+       OrchestrationEngineLive.pipe(
++        Layer.provide(WorktreeOperationGuard.layer),
++        Layer.provide(noProjectSettleScripts),
+         Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+         Layer.provide(ThreadBackgroundLiveness.layer),
+         Layer.provide(ThreadPlanProgress.layer),
+@@ -1717,6 +2082,8 @@ describe("OrchestrationEngine", () => {
+ 
+     const runtime = ManagedRuntime.make(
+       OrchestrationEngineLive.pipe(
++        Layer.provide(WorktreeOperationGuard.layer),
++        Layer.provide(noProjectSettleScripts),
+         Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+         Layer.provide(ThreadBackgroundLiveness.layer),
+         Layer.provide(ThreadPlanProgress.layer),
+diff --git a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+index 4350d145..b4363643 100644
+--- a/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
++++ b/apps/server/src/orchestration/Layers/OrchestrationEngine.ts
+@@ -5,7 +5,7 @@ import type {
+   ProjectId,
+   ThreadId,
+ } from "@t3tools/contracts";
+-import { OrchestrationCommand } from "@t3tools/contracts";
++import { CommandId, EventId, OrchestrationCommand } from "@t3tools/contracts";
+ import * as Cause from "effect/Cause";
+ import * as Clock from "effect/Clock";
+ import * as Crypto from "effect/Crypto";
+@@ -14,6 +14,8 @@ import * as Deferred from "effect/Deferred";
+ import * as Duration from "effect/Duration";
+ import * as Effect from "effect/Effect";
+ import * as Exit from "effect/Exit";
++import * as FileSystem from "effect/FileSystem";
++import * as Path from "effect/Path";
+ import * as Layer from "effect/Layer";
+ import * as Metric from "effect/Metric";
+ import * as Option from "effect/Option";
+@@ -45,6 +47,8 @@ import { createEmptyReadModel, projectEvent } from "../projector.ts";
+ import { OrchestrationProjectionPipeline } from "../Services/ProjectionPipeline.ts";
+ import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+ import { ThreadBackgroundLivenessService } from "../ThreadBackgroundLiveness.ts";
++import { WorktreeOperationGuard } from "../../project/WorktreeOperationGuard.ts";
++import { ProjectSettleScriptRunner } from "../../project/ProjectSettleScriptRunner.ts";
+ import {
+   OrchestrationEngineService,
+   type OrchestrationEngineShape,
+@@ -88,7 +92,13 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+   const projectionPipeline = yield* OrchestrationProjectionPipeline;
+   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
++  const settleScriptRunner = yield* ProjectSettleScriptRunner;
++  const worktreeOperations = yield* WorktreeOperationGuard;
+   const crypto = yield* Crypto.Crypto;
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const scope = yield* Effect.scope;
++  const settlingWorktrees = new Map<string, { threadId: ThreadId; projectId: ProjectId }>();
+ 
+   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+   let commandReadModel = createEmptyReadModel(yield* nowIso);
+@@ -108,6 +118,78 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+       return nextReadModel;
+     });
+ 
++  const assertCheckoutAvailable = Effect.fn("OrchestrationEngine.assertCheckoutAvailable")(
++    function* (command: OrchestrationCommand) {
++      if (settlingWorktrees.size === 0) return;
++      const checkouts: string[] = [];
++      let targetThreadId: ThreadId | undefined;
++      const projectRoot = (projectId: ProjectId) =>
++        commandReadModel.projects.find((project) => project.id === projectId)?.workspaceRoot;
++      if (
++        command.type === "project.delete" ||
++        (command.type === "project.meta.update" && command.workspaceRoot !== undefined)
++      ) {
++        if ([...settlingWorktrees.values()].some((busy) => busy.projectId === command.projectId)) {
++          return yield* new OrchestrationCommandInvariantError({
++            commandType: command.type,
++            detail:
++              "A worktree in this project is running a manual settle action. Wait for it to finish.",
++          });
++        }
++      }
++      if (command.type === "project.create" || command.type === "project.meta.update") {
++        if (command.workspaceRoot !== undefined) checkouts.push(command.workspaceRoot);
++      } else if (command.type === "thread.create") {
++        targetThreadId = command.threadId;
++        const cwd = command.worktreePath ?? projectRoot(command.projectId);
++        if (cwd) checkouts.push(cwd);
++      } else if (
++        command.type === "thread.unsettle" ||
++        command.type === "thread.unarchive" ||
++        command.type === "thread.turn.start" ||
++        command.type === "thread.delete" ||
++        command.type === "thread.archive" ||
++        command.type === "thread.checkpoint.revert" ||
++        command.type === "thread.runtime-mode.set" ||
++        command.type === "thread.approval.respond" ||
++        command.type === "thread.user-input.respond" ||
++        (command.type === "thread.meta.update" &&
++          (command.worktreePath !== undefined || command.branch !== undefined)) ||
++        (command.type === "thread.session.set" &&
++          (command.session.status === "starting" || command.session.status === "running"))
++      ) {
++        targetThreadId = command.threadId;
++        const thread = commandReadModel.threads.find((thread) => thread.id === command.threadId);
++        const cwd = thread && (thread.worktreePath ?? projectRoot(thread.projectId));
++        if (cwd) checkouts.push(cwd);
++        if (command.type === "thread.meta.update" && command.worktreePath !== undefined) {
++          const nextCwd = command.worktreePath ?? (thread && projectRoot(thread.projectId));
++          if (nextCwd) checkouts.push(nextCwd);
++        }
++        if (command.type === "thread.turn.start") {
++          const create = command.bootstrap?.createThread;
++          const nextCwd = create && (create.worktreePath ?? projectRoot(create.projectId));
++          if (nextCwd) checkouts.push(nextCwd);
++          const prepareCwd = command.bootstrap?.prepareWorktree?.projectCwd;
++          if (prepareCwd) checkouts.push(prepareCwd);
++        }
++      }
++      let busy = [...settlingWorktrees.values()].find((entry) => entry.threadId === targetThreadId);
++      for (const cwd of checkouts) {
++        const canonical = yield* fs
++          .realPath(cwd)
++          .pipe(Effect.orElseSucceed(() => path.resolve(cwd)));
++        busy ??= settlingWorktrees.get(canonical);
++      }
++      if (busy) {
++        return yield* new OrchestrationCommandInvariantError({
++          commandType: command.type,
++          detail: `This worktree is running a manual settle action for thread ${busy.threadId}. Wait for it to finish before reusing or changing the checkout.`,
++        });
++      }
++    },
++  );
++
+   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
+     const dispatchStartSequence = commandReadModel.snapshotSequence;
+     let processingStartedAtMs = 0;
+@@ -171,6 +253,8 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+           });
+         }
+ 
++        yield* assertCheckoutAvailable(envelope.command);
++
+         if (
+           envelope.command.type === "thread.auto-settle" &&
+           (yield* eventStore.hasEventAfter({
+@@ -237,6 +321,14 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+           ),
+         );
+         const plannedEvents = Array.isArray(eventBase) ? eventBase : [eventBase];
++        const manualThreadId =
++          envelope.command.type === "thread.settle" ? envelope.command.threadId : null;
++        const manualSettlementThreadId =
++          manualThreadId !== null &&
++          commandReadModel.threads.find((thread) => thread.id === manualThreadId)
++            ?.settledOverride !== "settled"
++            ? manualThreadId
++            : null;
+         // Stamp the dispatching client's origin onto every event the command
+         // produced. The decider stays pure; attribution is an engine concern.
+         const eventBases =
+@@ -314,6 +406,94 @@ const makeOrchestrationEngine = Effect.gen(function* () {
+             );
+           }
+         }
++        if (manualSettlementThreadId !== null) {
++          const appendSettleActivity = Effect.fn("OrchestrationEngine.appendSettleActivity")(
++            function* (
++              status: "started" | "completed" | "failed" | "skipped",
++              detail: string,
++              scriptId?: string,
++            ) {
++              const createdAt = yield* nowIso;
++              const id = EventId.make(yield* crypto.randomUUIDv4);
++              yield* dispatch({
++                type: "thread.activity.append",
++                commandId: CommandId.make(`${envelope.command.commandId}:settle-action:${id}`),
++                threadId: manualSettlementThreadId,
++                createdAt,
++                activity: {
++                  id,
++                  kind: `settle-script.${status}`,
++                  summary: `Manual settle action ${status}`,
++                  tone: status === "failed" ? "error" : "info",
++                  turnId: null,
++                  createdAt,
++                  payload: { detail, ...(scriptId ? { scriptId } : {}) },
++                },
++              });
++            },
++          );
++          let plan = yield* settleScriptRunner.prepare({
++            threadId: manualSettlementThreadId,
++            readModel: commandReadModel,
++          });
++          let releaseCheckout: (() => void) | null = null;
++          if (plan.kind === "ready") {
++            releaseCheckout = yield* worktreeOperations.tryAcquireCleanup(plan.cwd);
++            if (releaseCheckout === null) {
++              plan = {
++                kind: "skipped",
++                detail:
++                  "Another checkout operation or manual settle action is already running in this worktree.",
++              };
++            }
++          }
++          if (plan.kind !== "none") {
++            const cleanupPlan = plan;
++            if (cleanupPlan.kind === "ready") {
++              const thread = commandReadModel.threads.find(
++                (thread) => thread.id === manualSettlementThreadId,
++              )!;
++              // Reserve while still in the command worker; unrelated checkouts keep processing.
++              settlingWorktrees.set(cleanupPlan.cwd, {
++                threadId: thread.id,
++                projectId: thread.projectId,
++              });
++            }
++            yield* Effect.forkIn(
++              Effect.gen(function* () {
++                if (cleanupPlan.kind !== "ready") {
++                  yield* appendSettleActivity(cleanupPlan.kind, cleanupPlan.detail);
++                  return;
++                }
++                for (const script of cleanupPlan.scripts) {
++                  yield* appendSettleActivity(
++                    "started",
++                    `${script.name} in ${cleanupPlan.cwd}`,
++                    script.id,
++                  );
++                  const result = yield* settleScriptRunner.execute({
++                    script,
++                    cwd: cleanupPlan.cwd,
++                    env: cleanupPlan.env,
++                  });
++                  yield* appendSettleActivity(result.kind, result.detail, script.id);
++                  if (result.kind === "failed") break;
++                }
++              }).pipe(
++                Effect.catchCause((cause) =>
++                  Effect.logError("Manual settle action could not be recorded", cause),
++                ),
++                Effect.ensuring(
++                  Effect.sync(() => {
++                    if (cleanupPlan.kind === "ready") settlingWorktrees.delete(cleanupPlan.cwd);
++                    releaseCheckout?.();
++                  }),
++                ),
++              ),
++              scope,
++            );
++          }
++        }
+         return { sequence: committedCommand.lastSequence };
+       }).pipe(Effect.withSpan(`orchestration.command.${envelope.command.type}`)),
+     ).pipe(
+diff --git a/apps/server/src/orchestration/Layers/ProjectionPipeline.test.ts b/apps/server/src/orchestration/Layers/ProjectionPipeline.test.ts
+index 1a989958..7f6297e1 100644
+--- a/apps/server/src/orchestration/Layers/ProjectionPipeline.test.ts
++++ b/apps/server/src/orchestration/Layers/ProjectionPipeline.test.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "../../project/WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "../../project/ProjectSettleScriptRunner.testing.ts";
+ import {
+   ApprovalRequestId,
+   CheckpointRef,
+@@ -3881,6 +3883,8 @@ it.effect("restores pending turn-start metadata across projection pipeline resta
+ 
+ const engineLayer = it.layer(
+   OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+     Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
+     Layer.provide(ThreadBackgroundLiveness.layer),
+     Layer.provide(ThreadPlanProgress.layer),
+diff --git a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+index d93fec5a..c488e995 100644
+--- a/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
++++ b/apps/server/src/orchestration/Layers/ProviderCommandReactor.test.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "../../project/WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "../../project/ProjectSettleScriptRunner.testing.ts";
+ // @effect-diagnostics nodeBuiltinImport:off
+ import * as NodeFS from "node:fs";
+ import * as NodeOS from "node:os";
+@@ -397,6 +399,8 @@ describe("ProviderCommandReactor", () => {
+     };
+ 
+     const orchestrationLayer = OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+       Layer.provide(ThreadBackgroundLiveness.layer),
+       Layer.provide(ThreadPlanProgress.layer),
+diff --git a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts
+index 1094ab48..5de50a6a 100644
+--- a/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts
++++ b/apps/server/src/orchestration/Layers/ProviderRuntimeIngestion.test.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "../../project/WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "../../project/ProjectSettleScriptRunner.testing.ts";
+ // @effect-diagnostics nodeBuiltinImport:off
+ import * as NodeFS from "node:fs";
+ import * as NodeOS from "node:os";
+@@ -275,6 +277,8 @@ describe("ProviderRuntimeIngestion", () => {
+     const provider = createProviderServiceHarness();
+     const sqlCounter = makeSqlStatementCounter();
+     const orchestrationLayer = OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+       Layer.provide(OrchestrationProjectionPipelineLive),
+       Layer.provide(OrchestrationEventStoreLive),
+diff --git a/apps/server/src/orchestration/runtimeLayer.ts b/apps/server/src/orchestration/runtimeLayer.ts
+index 779042e2..2ef8c577 100644
+--- a/apps/server/src/orchestration/runtimeLayer.ts
++++ b/apps/server/src/orchestration/runtimeLayer.ts
+@@ -7,6 +7,10 @@ import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline
+ import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
+ import * as ThreadBackgroundLiveness from "./ThreadBackgroundLiveness.ts";
+ import * as ThreadPlanProgress from "./ThreadPlanProgress.ts";
++import * as WorktreeOperationGuard from "../project/WorktreeOperationGuard.ts";
++import * as ProjectSettleScriptRunner from "../project/ProjectSettleScriptRunner.ts";
++import * as ServerSettings from "../serverSettings.ts";
++import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+ 
+ export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
+   OrchestrationEventStoreLive,
+@@ -32,5 +36,14 @@ export const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
+ 
+ export const OrchestrationLayerLive = Layer.mergeAll(
+   OrchestrationInfrastructureLayerLive,
+-  OrchestrationEngineLive.pipe(Layer.provide(OrchestrationInfrastructureLayerLive)),
++  OrchestrationEngineLive.pipe(
++    Layer.provide(OrchestrationInfrastructureLayerLive),
++    Layer.provide(WorktreeOperationGuard.layer),
++    Layer.provide(
++      ProjectSettleScriptRunner.layer.pipe(
++        Layer.provide(ThreadBackgroundLiveness.layer),
++        Layer.provide(ServerSettings.layer.pipe(Layer.provide(ServerSecretStore.layer))),
++      ),
++    ),
++  ),
+ );
+diff --git a/apps/server/src/project/AgentSessionImporter.test.ts b/apps/server/src/project/AgentSessionImporter.test.ts
+index 38d6ad1d..dba4facc 100644
+--- a/apps/server/src/project/AgentSessionImporter.test.ts
++++ b/apps/server/src/project/AgentSessionImporter.test.ts
+@@ -1,3 +1,5 @@
++import * as WorktreeOperationGuard from "./WorktreeOperationGuard.ts";
++import { noProjectSettleScripts } from "./ProjectSettleScriptRunner.testing.ts";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+ import { describe, expect, it, vi } from "@effect/vitest";
+ import {
+@@ -561,6 +563,8 @@ const integrationRuntimeRepository = ProviderSessionRuntime.layer.pipe(
+ );
+ const integrationLayer = Layer.mergeAll(
+   OrchestrationEngineLive.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
++      Layer.provide(noProjectSettleScripts),
+     Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+     Layer.provide(OrchestrationProjectionPipelineLive),
+   ),
+diff --git a/apps/server/src/project/ProjectSettleScriptRunner.test.ts b/apps/server/src/project/ProjectSettleScriptRunner.test.ts
+new file mode 100644
+index 00000000..00453984
+--- /dev/null
++++ b/apps/server/src/project/ProjectSettleScriptRunner.test.ts
+@@ -0,0 +1,279 @@
++import { describe, expect, it, vi } from "@effect/vitest";
++import {
++  ProjectId,
++  ProviderInstanceId,
++  ThreadId,
++  type OrchestrationReadModel,
++  type ProjectScript,
++} from "@t3tools/contracts";
++import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++import { ChildProcessSpawner } from "effect/unstable/process";
++
++import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
++import * as ProcessRunner from "../processRunner.ts";
++import * as ServerSettings from "../serverSettings.ts";
++import * as Runner from "./ProjectSettleScriptRunner.ts";
++
++const NOW = "2026-01-01T00:00:00.000Z";
++const script: ProjectScript = {
++  id: "cleanup",
++  name: "Cleanup",
++  command: "fixture-cleanup",
++  icon: "configure",
++  runOnWorktreeCreate: false,
++  runOnThreadSettle: true,
++};
++const threadId = ThreadId.make("thread");
++const fixture = (): OrchestrationReadModel => ({
++  snapshotSequence: 0,
++  projects: [
++    {
++      id: ProjectId.make("project"),
++      title: "Project",
++      workspaceRoot: "/repo",
++      defaultModelSelection: null,
++      scripts: [script],
++      createdAt: NOW,
++      updatedAt: NOW,
++      deletedAt: null,
++    },
++  ],
++  threads: [
++    {
++      id: threadId,
++      projectId: ProjectId.make("project"),
++      title: "Thread",
++      modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
++      runtimeMode: "full-access",
++      interactionMode: "default",
++      branch: "task",
++      worktreePath: "/repo/task",
++      latestTurn: null,
++      createdAt: NOW,
++      updatedAt: NOW,
++      archivedAt: null,
++      settledOverride: "settled",
++      settledAt: NOW,
++      deletedAt: null,
++      messages: [],
++      proposedPlans: [],
++      activities: [],
++      checkpoints: [],
++      session: null,
++    },
++  ],
++  updatedAt: NOW,
++});
++const output = (code = 0, timedOut = false): ProcessRunner.ProcessRunOutput => ({
++  stdout: "fixture output",
++  stderr: "",
++  code: ChildProcessSpawner.ExitCode(code),
++  timedOut,
++  stdoutTruncated: false,
++  stderrTruncated: false,
++  stdoutInvalidUtf8: false,
++  stderrInvalidUtf8: false,
++});
++const testLayer = (
++  run: ProcessRunner.ProcessRunner["Service"]["run"] = () => Effect.die("unexpected command"),
++  settings = ServerSettings.layerTest(),
++) =>
++  Layer.effect(Runner.ProjectSettleScriptRunner, Runner.make).pipe(
++    Layer.provide(settings),
++    Layer.provideMerge(ThreadBackgroundLiveness.layer),
++    Layer.provide(Layer.succeed(ProcessRunner.ProcessRunner, { run })),
++    Layer.provide(
++      FileSystem.layerNoop({
++        realPath: (path) => Effect.succeed(path === "/alias/task" ? "/repo/task" : path),
++      }),
++    ),
++    Layer.provide(Path.layer),
++    Layer.provide(Layer.succeed(HostProcessEnvironment, { PATH: "/fixture/bin" })),
++    Layer.provide(Layer.succeed(HostProcessPlatform, "darwin")),
++  );
++
++describe("ProjectSettleScriptRunner", () => {
++  it.effect("prepares the canonical worktree and standard project/thread environment", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const model = fixture();
++      const plan = yield* runner.prepare({
++        threadId,
++        readModel: { ...model, threads: [{ ...model.threads[0]!, worktreePath: "/alias/task" }] },
++      });
++      expect(plan).toEqual({
++        kind: "ready",
++        scripts: [script],
++        cwd: "/repo/task",
++        env: {
++          T3CODE_PROJECT_ROOT: "/repo",
++          T3CODE_WORKTREE_PATH: "/repo/task",
++          T3CODE_THREAD_ID: "thread",
++        },
++      });
++    }).pipe(Effect.provide(testLayer())),
++  );
++
++  it.effect("never opts projects into inherited machine cleanup actions", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const model = fixture();
++      expect(
++        yield* runner.prepare({
++          threadId,
++          readModel: { ...model, projects: [{ ...model.projects[0]!, scripts: [] }] },
++        }),
++      ).toEqual({ kind: "none" });
++    }).pipe(
++      Effect.provide(
++        testLayer(undefined, ServerSettings.layerTest({ defaultProjectScripts: [script] })),
++      ),
++    ),
++  );
++
++  it.effect("skips local and primary checkouts, even when flagged", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const model = fixture();
++      for (const worktreePath of [null, "/repo"]) {
++        expect(
++          yield* runner.prepare({
++            threadId,
++            readModel: { ...model, threads: [{ ...model.threads[0]!, worktreePath }] },
++          }),
++        ).toMatchObject({ kind: "skipped" });
++      }
++    }).pipe(Effect.provide(testLayer())),
++  );
++
++  it.effect("skips canonical checkouts shared by an active thread but permits settled peers", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const model = fixture();
++      const peer = {
++        ...model.threads[0]!,
++        id: ThreadId.make("peer"),
++        title: "Peer",
++        worktreePath: "/alias/task",
++      };
++      expect(
++        yield* runner.prepare({
++          threadId,
++          readModel: { ...model, threads: [...model.threads, { ...peer, settledOverride: null }] },
++        }),
++      ).toMatchObject({ kind: "skipped", detail: expect.stringContaining("Peer") });
++      expect(
++        yield* runner.prepare({
++          threadId,
++          readModel: { ...model, threads: [...model.threads, peer] },
++        }),
++      ).toMatchObject({ kind: "ready" });
++    }).pipe(Effect.provide(testLayer())),
++  );
++
++  it.effect("skips a queued permission restart", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const model = fixture();
++      for (const status of ["ready", "stopped"] as const) {
++        expect(
++          yield* runner.prepare({
++            threadId,
++            readModel: {
++              ...model,
++              threads: [
++                {
++                  ...model.threads[0]!,
++                  session: {
++                    threadId,
++                    status,
++                    providerName: "Codex",
++                    runtimeMode: "approval-required",
++                    activeTurnId: null,
++                    lastError: null,
++                    updatedAt: NOW,
++                  },
++                },
++              ],
++            },
++          }),
++        ).toMatchObject({ kind: status === "ready" ? "skipped" : "ready" });
++      }
++    }).pipe(Effect.provide(testLayer())),
++  );
++
++  it.effect("skips live background work even for settled peer threads", () =>
++    Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      const liveness = yield* ThreadBackgroundLiveness.ThreadBackgroundLivenessService;
++      const model = fixture();
++      liveness.recordTaskLiveness({
++        threadId,
++        taskId: "task",
++        taskType: "agent",
++        status: "running",
++        kind: "started",
++      });
++      expect(yield* runner.prepare({ threadId, readModel: model })).toMatchObject({
++        kind: "skipped",
++        detail: expect.stringContaining("background"),
++      });
++      liveness.clearThreadLiveness(threadId);
++      liveness.recordTaskLiveness({
++        threadId: "peer",
++        taskId: "task",
++        taskType: "agent",
++        status: "running",
++        kind: "started",
++      });
++      expect(
++        yield* runner.prepare({
++          threadId,
++          readModel: {
++            ...model,
++            threads: [...model.threads, { ...model.threads[0]!, id: ThreadId.make("peer") }],
++          },
++        }),
++      ).toMatchObject({ kind: "skipped", detail: expect.stringContaining("shares") });
++    }).pipe(Effect.provide(testLayer())),
++  );
++
++  it.effect("waits for successful command exit and bounds output and runtime", () => {
++    const run = vi.fn(() => Effect.succeed(output()));
++    return Effect.gen(function* () {
++      const runner = yield* Runner.ProjectSettleScriptRunner;
++      expect(
++        yield* runner.execute({ script, cwd: "/repo/task", env: { T3CODE_THREAD_ID: "thread" } }),
++      ).toEqual({ kind: "completed", detail: "fixture output" });
++      expect(run).toHaveBeenCalledWith({
++        command: "/bin/sh",
++        args: ["-c", "fixture-cleanup"],
++        cwd: "/repo/task",
++        env: { PATH: "/fixture/bin", T3CODE_THREAD_ID: "thread" },
++        timeout: "2 minutes",
++        maxOutputBytes: 8000,
++        outputMode: "truncate",
++        timeoutBehavior: "timedOutResult",
++      });
++    }).pipe(Effect.provide(testLayer(run)));
++  });
++
++  it.effect("reports failed exits and timeouts without claiming cleanup succeeded", () =>
++    Effect.gen(function* () {
++      for (const result of [output(12), output(0, true)]) {
++        const actual = yield* Effect.gen(function* () {
++          const runner = yield* Runner.ProjectSettleScriptRunner;
++          return yield* runner.execute({ script, cwd: "/repo/task", env: {} });
++        }).pipe(Effect.provide(testLayer(() => Effect.succeed(result))));
++        expect(actual).toMatchObject({
++          kind: "failed",
++          detail: expect.stringContaining(result.timedOut ? "timed out" : "code 12"),
++        });
++      }
++    }),
++  );
++});
+diff --git a/apps/server/src/project/ProjectSettleScriptRunner.testing.ts b/apps/server/src/project/ProjectSettleScriptRunner.testing.ts
+new file mode 100644
+index 00000000..5d8dffc4
+--- /dev/null
++++ b/apps/server/src/project/ProjectSettleScriptRunner.testing.ts
+@@ -0,0 +1,10 @@
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++
++import { ProjectSettleScriptRunner } from "./ProjectSettleScriptRunner.ts";
++
++/** Existing orchestration tests opt out of external project commands explicitly. */
++export const noProjectSettleScripts = Layer.succeed(ProjectSettleScriptRunner, {
++  prepare: () => Effect.succeed({ kind: "none" }),
++  execute: () => Effect.die("Unexpected settle script execution"),
++});
+diff --git a/apps/server/src/project/ProjectSettleScriptRunner.ts b/apps/server/src/project/ProjectSettleScriptRunner.ts
+new file mode 100644
+index 00000000..17f570be
+--- /dev/null
++++ b/apps/server/src/project/ProjectSettleScriptRunner.ts
+@@ -0,0 +1,170 @@
++import type { OrchestrationReadModel, ProjectScript, ThreadId } from "@t3tools/contracts";
++import { HostProcessEnvironment, HostProcessPlatform } from "@t3tools/shared/hostProcess";
++import { projectScriptRuntimeEnv, settleProjectScripts } from "@t3tools/shared/projectScripts";
++import * as Cause from "effect/Cause";
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++
++import { ThreadBackgroundLivenessService } from "../orchestration/ThreadBackgroundLiveness.ts";
++import * as ProcessRunner from "../processRunner.ts";
++import { ServerSettingsService } from "../serverSettings.ts";
++
++export type ProjectSettleScriptPlan =
++  | { readonly kind: "none" }
++  | { readonly kind: "skipped" | "failed"; readonly detail: string }
++  | {
++      readonly kind: "ready";
++      readonly scripts: readonly ProjectScript[];
++      readonly cwd: string;
++      readonly env: Record<string, string>;
++    };
++
++export interface ProjectSettleScriptResult {
++  readonly kind: "completed" | "failed";
++  readonly detail: string;
++}
++
++export class ProjectSettleScriptRunner extends Context.Service<
++  ProjectSettleScriptRunner,
++  {
++    readonly prepare: (input: {
++      readonly threadId: ThreadId;
++      readonly readModel: OrchestrationReadModel;
++    }) => Effect.Effect<ProjectSettleScriptPlan>;
++    readonly execute: (input: {
++      readonly script: ProjectScript;
++      readonly cwd: string;
++      readonly env: Record<string, string>;
++    }) => Effect.Effect<ProjectSettleScriptResult>;
++  }
++>()("t3/project/ProjectSettleScriptRunner") {}
++
++const failure = (cause: Cause.Cause<unknown>) =>
++  Cause.hasInterruptsOnly(cause)
++    ? Effect.interrupt
++    : Effect.succeed({ kind: "failed" as const, detail: Cause.pretty(cause).slice(0, 8_000) });
++
++export const make = Effect.gen(function* () {
++  const settings = yield* ServerSettingsService;
++  const backgroundLiveness = yield* ThreadBackgroundLivenessService;
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const processRunner = yield* ProcessRunner.ProcessRunner;
++  const environment = yield* HostProcessEnvironment;
++  const platform = yield* HostProcessPlatform;
++
++  const prepare: ProjectSettleScriptRunner["Service"]["prepare"] = Effect.fn(
++    "ProjectSettleScriptRunner.prepare",
++  )(function* ({ threadId, readModel }) {
++    const thread = readModel.threads.find((candidate) => candidate.id === threadId);
++    const project = readModel.projects.find((candidate) => candidate.id === thread?.projectId);
++    if (!thread || !project) return { kind: "none" } as const;
++    const scripts = settleProjectScripts(yield* settings.getSettings, project);
++    if (scripts.length === 0) return { kind: "none" } as const;
++    if (backgroundLiveness.getThreadBackgroundLiveness(thread.id) !== null) {
++      return {
++        kind: "skipped",
++        detail: "This thread still has live background work in its worktree.",
++      } as const;
++    }
++    if (
++      thread.session &&
++      thread.session.status !== "stopped" &&
++      thread.session.runtimeMode !== thread.runtimeMode
++    ) {
++      return {
++        kind: "skipped",
++        detail: "A provider permission change is still pending in this worktree.",
++      } as const;
++    }
++    if (!thread.worktreePath) {
++      return {
++        kind: "skipped",
++        detail: "Settle actions require a worktree; local checkouts are preserved.",
++      } as const;
++    }
++    const cwd = yield* fs.realPath(thread.worktreePath);
++    const projectRoot = yield* fs.realPath(project.workspaceRoot);
++    if (cwd === projectRoot) {
++      return {
++        kind: "skipped",
++        detail: "Settle actions do not run in the project's primary checkout.",
++      } as const;
++    }
++    const projects = new Map(readModel.projects.map((candidate) => [candidate.id, candidate]));
++    for (const other of readModel.threads) {
++      if (
++        other.id === thread.id ||
++        other.deletedAt !== null ||
++        ((other.archivedAt !== null || other.settledOverride === "settled") &&
++          other.session?.status !== "starting" &&
++          other.session?.status !== "running" &&
++          (other.session === null ||
++            other.session.status === "stopped" ||
++            other.session.runtimeMode === other.runtimeMode) &&
++          backgroundLiveness.getThreadBackgroundLiveness(other.id) === null)
++      )
++        continue;
++      const otherCwd = other.worktreePath ?? projects.get(other.projectId)?.workspaceRoot;
++      if (!otherCwd) continue;
++      const canonicalOther = yield* fs
++        .realPath(otherCwd)
++        .pipe(Effect.orElseSucceed(() => path.resolve(otherCwd)));
++      if (canonicalOther === cwd) {
++        return {
++          kind: "skipped",
++          detail: `Settle actions skipped because active thread '${other.title}' (${other.id}) shares this checkout.`,
++        } as const;
++      }
++    }
++    return {
++      kind: "ready",
++      scripts,
++      cwd,
++      env: projectScriptRuntimeEnv({
++        project: { cwd: projectRoot },
++        worktreePath: cwd,
++        extraEnv: { T3CODE_THREAD_ID: thread.id },
++      }),
++    } as const;
++  }, Effect.catchCause(failure));
++
++  const execute: ProjectSettleScriptRunner["Service"]["execute"] = Effect.fn(
++    "ProjectSettleScriptRunner.execute",
++  )(function* ({ script, cwd, env }) {
++    const result = yield* processRunner.run({
++      command: platform === "win32" ? (environment.ComSpec ?? "cmd.exe") : "/bin/sh",
++      args: platform === "win32" ? ["/d", "/s", "/c", script.command] : ["-c", script.command],
++      cwd,
++      env: { ...environment, ...env },
++      timeout: "2 minutes",
++      maxOutputBytes: 8_000,
++      outputMode: "truncate",
++      timeoutBehavior: "timedOutResult",
++    });
++    const output = [result.stdout, result.stderr].filter(Boolean).join("\n").slice(0, 8_000);
++    if (result.timedOut || result.code !== 0) {
++      return {
++        kind: "failed",
++        detail: [
++          result.timedOut
++            ? "Command timed out after two minutes."
++            : `Command exited with code ${result.code ?? "unknown"}.`,
++          output,
++        ]
++          .filter(Boolean)
++          .join("\n"),
++      } as const;
++    }
++    return { kind: "completed", detail: output || "Command completed successfully." } as const;
++  }, Effect.catchCause(failure));
++
++  return ProjectSettleScriptRunner.of({ prepare, execute });
++});
++
++export const layer = Layer.effect(ProjectSettleScriptRunner, make).pipe(
++  Layer.provide(ProcessRunner.layer),
++);
+diff --git a/apps/server/src/project/WorktreeOperationGuard.test.ts b/apps/server/src/project/WorktreeOperationGuard.test.ts
+new file mode 100644
+index 00000000..d2728631
+--- /dev/null
++++ b/apps/server/src/project/WorktreeOperationGuard.test.ts
+@@ -0,0 +1,120 @@
++import { expect, it } from "@effect/vitest";
++import * as Deferred from "effect/Deferred";
++import * as Effect from "effect/Effect";
++import * as Fiber from "effect/Fiber";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++
++import { layer, WorktreeOperationGuard } from "./WorktreeOperationGuard.ts";
++
++const testLayer = layer.pipe(
++  Layer.provide(
++    FileSystem.layerNoop({
++      realPath: (cwd) => Effect.succeed(cwd === "/alias/task" ? "/repo/task" : cwd),
++    }),
++  ),
++  Layer.provide(Path.layer),
++);
++
++it.effect("cleanup rejects mutations through aliases while unrelated checkouts continue", () =>
++  Effect.gen(function* () {
++    const guard = yield* WorktreeOperationGuard;
++    const release = yield* guard.tryAcquireCleanup("/repo/task");
++    expect(release).not.toBeNull();
++    expect(yield* guard.tryAcquireCleanup("/alias/task")).toBeNull();
++    let ran = false;
++    const rejected = yield* guard
++      .withMutation(
++        ["/alias/task"],
++        Effect.sync(() => {
++          ran = true;
++        }),
++      )
++      .pipe(Effect.flip);
++    expect(rejected._tag).toBe("WorktreeCleanupBusyError");
++    expect(ran).toBe(false);
++    expect(yield* guard.withMutation(["/repo/other"], Effect.succeed("finished"))).toBe("finished");
++    release!();
++    const releaseAgain = yield* guard.tryAcquireCleanup("/alias/task");
++    expect(releaseAgain).not.toBeNull();
++    release!();
++    expect(yield* guard.tryAcquireCleanup("/repo/task")).toBeNull();
++    releaseAgain!();
++  }).pipe(Effect.provide(testLayer)),
++);
++
++it.effect("cleanup skips prior mutations until all nested operations release", () =>
++  Effect.gen(function* () {
++    const guard = yield* WorktreeOperationGuard;
++    yield* guard.withMutation(
++      ["/repo/task", "/alias/task"],
++      Effect.gen(function* () {
++        expect(yield* guard.tryAcquireCleanup("/alias/task")).toBeNull();
++        const unrelated = yield* guard.tryAcquireCleanup("/repo/other");
++        expect(unrelated).not.toBeNull();
++        unrelated!();
++        yield* guard.withMutation(["/repo/task"], Effect.void);
++        expect(yield* guard.tryAcquireCleanup("/repo/task")).toBeNull();
++      }),
++    );
++    const release = yield* guard.tryAcquireCleanup("/repo/task");
++    expect(release).not.toBeNull();
++    release!();
++  }).pipe(Effect.provide(testLayer)),
++);
++
++it.effect("failed multi-checkout acquisition leaves no partial mutation lease", () =>
++  Effect.gen(function* () {
++    const guard = yield* WorktreeOperationGuard;
++    const releaseBusy = yield* guard.tryAcquireCleanup("/repo/busy");
++    yield* guard.withMutation(["/repo/free", "/repo/busy"], Effect.void).pipe(Effect.flip);
++    const releaseFree = yield* guard.tryAcquireCleanup("/repo/free");
++    expect(releaseFree).not.toBeNull();
++    releaseFree!();
++    releaseBusy!();
++  }).pipe(Effect.provide(testLayer)),
++);
++
++it.effect("mutation failure and interruption both release ownership", () =>
++  Effect.gen(function* () {
++    const guard = yield* WorktreeOperationGuard;
++    expect(yield* guard.withMutation(["/repo/task"], Effect.fail("failed")).pipe(Effect.flip)).toBe(
++      "failed",
++    );
++    const afterFailure = yield* guard.tryAcquireCleanup("/repo/task");
++    expect(afterFailure).not.toBeNull();
++    afterFailure!();
++
++    const entered = yield* Deferred.make<void>();
++    const mutation = yield* guard
++      .withMutation(
++        ["/repo/task"],
++        Effect.gen(function* () {
++          yield* Deferred.succeed(entered, undefined);
++          return yield* Effect.never;
++        }),
++      )
++      .pipe(Effect.forkChild);
++    yield* Deferred.await(entered);
++    expect(yield* guard.tryAcquireCleanup("/repo/task")).toBeNull();
++    yield* Fiber.interrupt(mutation);
++    const afterInterrupt = yield* guard.tryAcquireCleanup("/repo/task");
++    expect(afterInterrupt).not.toBeNull();
++    afterInterrupt!();
++  }).pipe(Effect.provide(testLayer)),
++);
++
++it.effect("missing paths use normalized absolute paths for both kinds of ownership", () =>
++  Effect.gen(function* () {
++    const guard = yield* WorktreeOperationGuard;
++    yield* guard.withMutation(
++      ["/repo/missing/../task"],
++      Effect.gen(function* () {
++        expect(yield* guard.tryAcquireCleanup("/repo/task")).toBeNull();
++      }),
++    );
++  }).pipe(
++    Effect.provide(layer.pipe(Layer.provide(FileSystem.layerNoop({})), Layer.provide(Path.layer))),
++  ),
++);
+diff --git a/apps/server/src/project/WorktreeOperationGuard.ts b/apps/server/src/project/WorktreeOperationGuard.ts
+new file mode 100644
+index 00000000..238914ec
+--- /dev/null
++++ b/apps/server/src/project/WorktreeOperationGuard.ts
+@@ -0,0 +1,82 @@
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as FileSystem from "effect/FileSystem";
++import * as Layer from "effect/Layer";
++import * as Path from "effect/Path";
++import * as Schema from "effect/Schema";
++
++export class WorktreeCleanupBusyError extends Schema.TaggedErrorClass<WorktreeCleanupBusyError>()(
++  "WorktreeCleanupBusyError",
++  { cwd: Schema.String },
++) {
++  override get message() {
++    return `A manual settle action is running in ${this.cwd}. Wait for it to finish before changing the checkout.`;
++  }
++}
++
++export class WorktreeOperationGuard extends Context.Service<
++  WorktreeOperationGuard,
++  {
++    readonly withMutation: <A, E, R>(
++      cwds: readonly string[],
++      effect: Effect.Effect<A, E, R>,
++    ) => Effect.Effect<A, E | WorktreeCleanupBusyError, R>;
++    /** Reserve before launching cleanup; null means an operation already owns this checkout. */
++    readonly tryAcquireCleanup: (cwd: string) => Effect.Effect<(() => void) | null>;
++  }
++>()("t3/project/WorktreeOperationGuard") {}
++
++export const make = Effect.gen(function* () {
++  const fs = yield* FileSystem.FileSystem;
++  const path = yield* Path.Path;
++  const operations = new Map<string, { mutations: number; cleanup: boolean }>();
++  const canonicalize = (cwd: string) =>
++    fs.realPath(cwd).pipe(Effect.orElseSucceed(() => path.resolve(cwd)));
++
++  const acquireMutation = Effect.fn("WorktreeOperationGuard.acquireMutation")(function* (
++    cwds: readonly string[],
++  ) {
++    const canonicalPaths = new Set(yield* Effect.forEach(cwds, canonicalize));
++    for (const cwd of canonicalPaths) {
++      if (operations.get(cwd)?.cleanup) return yield* new WorktreeCleanupBusyError({ cwd });
++    }
++    for (const cwd of canonicalPaths) {
++      const state = operations.get(cwd) ?? { mutations: 0, cleanup: false };
++      state.mutations++;
++      operations.set(cwd, state);
++    }
++    let released = false;
++    return () => {
++      if (released) return;
++      released = true;
++      for (const cwd of canonicalPaths) {
++        const state = operations.get(cwd)!;
++        if (--state.mutations === 0) operations.delete(cwd);
++      }
++    };
++  });
++
++  const tryAcquireCleanup = Effect.fn("WorktreeOperationGuard.tryAcquireCleanup")(function* (
++    cwd: string,
++  ) {
++    const canonical = yield* canonicalize(cwd);
++    if (operations.has(canonical)) return null;
++    const state = { mutations: 0, cleanup: true };
++    operations.set(canonical, state);
++    return () => {
++      if (operations.get(canonical) === state) operations.delete(canonical);
++    };
++  });
++
++  return WorktreeOperationGuard.of({
++    withMutation: (cwds, effect) =>
++      Effect.acquireUseRelease(
++        acquireMutation(cwds),
++        () => effect,
++        (release) => Effect.sync(release),
++      ),
++    tryAcquireCleanup,
++  });
++});
++
++export const layer = Layer.effect(WorktreeOperationGuard, make);
+diff --git a/apps/server/src/server.test.ts b/apps/server/src/server.test.ts
+index 64bfea1b..bd07b272 100644
+--- a/apps/server/src/server.test.ts
++++ b/apps/server/src/server.test.ts
+@@ -1,3 +1,4 @@
++import * as WorktreeOperationGuard from "./project/WorktreeOperationGuard.ts";
+ import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
+ import * as NodeSocket from "@effect/platform-node/NodeSocket";
+ import * as NodeServices from "@effect/platform-node/NodeServices";
+@@ -1018,6 +1019,7 @@ const buildAppUnderTest = (options?: {
+     );
+ 
+     const appLayer = servedRoutesLayer.pipe(
++      Layer.provide(WorktreeOperationGuard.layer),
+       Layer.provide(resourceTelemetryLayer),
+       Layer.provide(UsageService.layerTest),
+       Layer.provide(
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 34964496..c58548e0 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -126,6 +126,7 @@ import * as ResourceMonitorBinary from "./resourceTelemetry/ResourceMonitorBinar
+ import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
+ import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
+ import * as UsageService from "./usage/UsageService.ts";
++import * as WorktreeOperationGuard from "./project/WorktreeOperationGuard.ts";
+ import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+ import {
+   clearPersistedServerRuntimeState,
+@@ -480,6 +481,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
+   // with explicit `providerInstances` entries on boot.
+   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+ ).pipe(
++  Layer.provideMerge(WorktreeOperationGuard.layer),
+   Layer.provideMerge(AntigravityInstallation.layer),
+   // Shared native/canonical NDJSON writers used by both the per-instance
+   // drivers (native stream, written from inside each `<X>Adapter`) and
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index b4255c64..4842fa5e 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -125,6 +125,7 @@ import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
+ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
+ import * as ReviewService from "./review/ReviewService.ts";
+ import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
++import { WorktreeOperationGuard } from "./project/WorktreeOperationGuard.ts";
+ import * as AgentSessionScanner from "./project/AgentSessionScanner.ts";
+ import { importRecentAgentThreads } from "./project/AgentSessionImporter.ts";
+ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
+@@ -570,6 +571,7 @@ const makeWsRpcLayer = (
+         return true;
+       });
+       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
++      const worktreeOperations = yield* WorktreeOperationGuard;
+       const agentSessionScanner = yield* AgentSessionScanner.AgentSessionScanner;
+       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
+@@ -1092,6 +1094,12 @@ const makeWsRpcLayer = (
+                 );
+             });
+ 
++          const finishBootstrap = () =>
++            Effect.gen(function* () {
++              yield* runSetupProgram();
++              return yield* dispatchFromClient(finalTurnStartCommand);
++            });
++
+           const bootstrapProgram = Effect.gen(function* () {
+             if (bootstrap?.createThread) {
+               const created = yield* dispatchFromClient({
+@@ -1152,22 +1160,38 @@ const makeWsRpcLayer = (
+                 path: null,
+               });
+               targetWorktreePath = worktree.worktree.path;
+-              yield* dispatchFromClient({
+-                type: "thread.meta.update",
+-                commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
+-                threadId: command.threadId,
+-                branch: worktree.worktree.refName,
+-                worktreePath: targetWorktreePath,
+-              });
+-              yield* refreshGitStatus(targetWorktreePath);
++              return yield* worktreeOperations.withMutation(
++                [targetWorktreePath],
++                Effect.gen(function* () {
++                  yield* dispatchFromClient({
++                    type: "thread.meta.update",
++                    commandId: yield* serverCommandId("bootstrap-thread-meta-update"),
++                    threadId: command.threadId,
++                    branch: worktree.worktree.refName,
++                    worktreePath: worktree.worktree.path,
++                  });
++                  yield* refreshGitStatus(worktree.worktree.path);
++                  return yield* finishBootstrap();
++                }),
++              );
+             }
+ 
+-            yield* runSetupProgram();
+-
+-            return yield* dispatchFromClient(finalTurnStartCommand);
++            return yield* finishBootstrap();
+           });
+ 
+           return yield* bootstrapProgram.pipe(
++            (effect) =>
++              worktreeOperations.withMutation(
++                [
++                  ...(bootstrap?.createThread?.worktreePath
++                    ? [bootstrap.createThread.worktreePath]
++                    : []),
++                  ...(bootstrap?.prepareWorktree?.projectCwd
++                    ? [bootstrap.prepareWorktree.projectCwd]
++                    : []),
++                ],
++                effect,
++              ),
+             Effect.catchCause((cause) => {
+               const dispatchError = toBootstrapDispatchCommandCauseError(cause);
+               if (Cause.hasInterruptsOnly(cause)) {
+diff --git a/apps/web/src/components/BranchToolbarBranchSelector.tsx b/apps/web/src/components/BranchToolbarBranchSelector.tsx
+index c952fab9..79ad357c 100644
+--- a/apps/web/src/components/BranchToolbarBranchSelector.tsx
++++ b/apps/web/src/components/BranchToolbarBranchSelector.tsx
+@@ -776,6 +776,9 @@ export function BranchToolbarBranchSelector({
+             render={<Button variant="ghost" size="xs" />}
+             className="min-w-0 max-w-full font-normal text-muted-foreground/70 text-xs! hover:text-foreground/80"
+             disabled={isInitialBranchesLoadPending || isBranchActionPending}
++            data-micro-dial-control={
++              isInitialBranchesLoadPending || isBranchActionPending ? undefined : "branch"
++            }
+           >
+             <GitBranchIcon className="size-3 shrink-0 opacity-70" />
+             <span
+@@ -798,6 +801,7 @@ export function BranchToolbarBranchSelector({
+         side="top"
+         className="flex w-80 flex-col"
+         {...composerFloatingLayerProps}
++        data-micro-dial-popup="branch"
+       >
+         <div className="shrink-0 px-3 pt-2.5">
+           <div className="relative -translate-y-px border-b border-border/70 pb-1.5 transition-colors focus-within:border-ring">
+diff --git a/apps/web/src/components/BranchToolbarEnvModeSelector.tsx b/apps/web/src/components/BranchToolbarEnvModeSelector.tsx
+index 611bd423..c8cd8f43 100644
+--- a/apps/web/src/components/BranchToolbarEnvModeSelector.tsx
++++ b/apps/web/src/components/BranchToolbarEnvModeSelector.tsx
+@@ -93,6 +93,7 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
+         size="xs"
+         className="min-w-0 shrink font-normal text-xs!"
+         aria-label="Workspace"
++        data-micro-dial-control="workspace"
+         data-composer-context-control
+       >
+         {effectiveEnvMode === "worktree" ? (
+@@ -114,7 +115,11 @@ export const BranchToolbarEnvModeSelector = memo(function BranchToolbarEnvModeSe
+           </span>
+         </span>
+       </SelectTrigger>
+-      <SelectPopup alignItemWithTrigger={false} {...composerFloatingLayerProps}>
++      <SelectPopup
++        alignItemWithTrigger={false}
++        {...composerFloatingLayerProps}
++        data-micro-dial-popup="workspace"
++      >
+         <SelectGroup>
+           <SelectGroupLabel>Workspace</SelectGroupLabel>
+           <SelectItem value="local">
+diff --git a/apps/web/src/components/BranchToolbarEnvironmentSelector.tsx b/apps/web/src/components/BranchToolbarEnvironmentSelector.tsx
+index 863cc731..c8c9e18a 100644
+--- a/apps/web/src/components/BranchToolbarEnvironmentSelector.tsx
++++ b/apps/web/src/components/BranchToolbarEnvironmentSelector.tsx
+@@ -95,6 +95,7 @@ export const BranchToolbarEnvironmentSelector = memo(function BranchToolbarEnvir
+         size="xs"
+         className="min-w-0 max-w-full font-normal text-xs!"
+         aria-label="Run on"
++        data-micro-dial-control="environment"
+         data-composer-context-control
+       >
+         {autoEnvironmentLabel ? (
+@@ -117,7 +118,11 @@ export const BranchToolbarEnvironmentSelector = memo(function BranchToolbarEnvir
+           </span>
+         </span>
+       </SelectTrigger>
+-      <SelectPopup alignItemWithTrigger={false} {...composerFloatingLayerProps}>
++      <SelectPopup
++        alignItemWithTrigger={false}
++        {...composerFloatingLayerProps}
++        data-micro-dial-popup="environment"
++      >
+         <SelectGroup>
+           <SelectGroupLabel>Run on</SelectGroupLabel>
+           {onAutoEnvironment && (
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index 904a6ace..9a390d0e 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -1,4 +1,5 @@
+ import { useLoadBalancedEnvironment } from "../hooks/useLoadBalancedEnvironment";
++import { useMicroControls } from "../hooks/useMicroControls";
+ import type { UsageLimitSourceSnapshots } from "@t3tools/contracts";
+ import {
+   collectProviderUsageLimits,
+@@ -1549,6 +1550,7 @@ export default function ChatView(props: ChatViewProps) {
+   const composerTerminalContextsRef = useRef<TerminalContextDraft[]>([]);
+   const composerElementContextsRef = useRef<ElementContextDraft[]>([]);
+   const localComposerRef = useRef<ChatComposerHandle | null>(null);
++  const [microChatRoot, setMicroChatRoot] = useState<HTMLDivElement | null>(null);
+   const composerRef = useComposerHandleContext() ?? localComposerRef;
+   const [restingComposerControlsHost, setRestingComposerControlsHost] =
+     useState<HTMLDivElement | null>(null);
+@@ -4641,6 +4643,22 @@ export default function ChatView(props: ChatViewProps) {
+       void legendListRef.current?.scrollToEnd?.({ animated });
+     });
+   }, []);
++  const microDialHint = useMicroControls({
++    scope: draftId ?? activeThreadKey,
++    root: microChatRoot,
++    focusComposer: () => composerRef.current?.focusAtEnd(),
++    scroll: (direction) => {
++      cancelTimelineLiveFollowForUserNavigation();
++      getTimelineScrollableNode()?.scrollBy({ top: direction * 80, behavior: "instant" });
++    },
++    latest: () => scrollToEnd(),
++    settleThread: () => handleSettleActiveThread(),
++    toggleTerminal: () => {
++      if (!activeThreadRef || !activeProject) return false;
++      toggleTerminalVisibility();
++      return true;
++    },
++  });
+   useLayoutEffect(() => {
+     if (timelineScrollModeRef.current !== "anchoring-new-turn") {
+       return;
+@@ -5214,6 +5232,22 @@ export default function ChatView(props: ChatViewProps) {
+   ]);
+   const activeThreadSettled =
+     supportsSettlement && activeThreadShell?.settledOverride === "settled";
++  const handleSettleActiveThread = useCallback(() => {
++    if (!isServerThread || !activeThreadRef || !supportsSettlement || activeThreadSettled)
++      return false;
++    void settleThread(activeThreadRef).then((result) => {
++      if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
++      const error = squashAtomCommandFailure(result);
++      toastManager.add(
++        stackedThreadToast({
++          type: "error",
++          title: "Failed to settle thread",
++          description: error instanceof Error ? error.message : "An error occurred.",
++        }),
++      );
++    });
++    return true;
++  }, [activeThreadRef, activeThreadSettled, isServerThread, settleThread, supportsSettlement]);
+   const unsettleThreadMutation = useAtomCommand(threadEnvironment.unsettle, {
+     reportFailure: false,
+   });
+@@ -5849,17 +5883,7 @@ export default function ChatView(props: ChatViewProps) {
+           return;
+         }
+ 
+-        void settleThread(activeThreadRef).then((result) => {
+-          if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
+-          const error = squashAtomCommandFailure(result);
+-          toastManager.add(
+-            stackedThreadToast({
+-              type: "error",
+-              title: "Failed to settle thread",
+-              description: error instanceof Error ? error.message : "An error occurred.",
+-            }),
+-          );
+-        });
++        handleSettleActiveThread();
+         return;
+       }
+ 
+@@ -6017,7 +6041,7 @@ export default function ChatView(props: ChatViewProps) {
+     isServerThread,
+     onToggleDiff,
+     pinThread,
+-    settleThread,
++    handleSettleActiveThread,
+     supportsPinning,
+     supportsSettlement,
+     confirmAndUnpinThread,
+@@ -7748,6 +7772,8 @@ export default function ChatView(props: ChatViewProps) {
+           rightPanelMaximized ? "w-0 flex-none" : "flex-1",
+         )}
+         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
++        ref={setMicroChatRoot}
++        tabIndex={-1}
+       >
+         {/* Top bar */}
+         <WorkspacePageHeader
+@@ -8122,10 +8148,16 @@ export default function ChatView(props: ChatViewProps) {
+                         </div>
+                       </div>
+                     </ComposerSurface.Shell>
+-                    <div
+-                      aria-hidden
+-                      className="h-[calc(env(safe-area-inset-bottom)+1rem)] sm:h-[calc(env(safe-area-inset-bottom)+1.25rem)]"
+-                    />
++                    <div className="min-h-[calc(env(safe-area-inset-bottom)+1rem)] pb-[env(safe-area-inset-bottom)] sm:min-h-[calc(env(safe-area-inset-bottom)+1.25rem)]">
++                      {microDialHint ? (
++                        <div
++                          role="status"
++                          className="pointer-events-none px-2 py-0.5 text-center text-[11px] leading-4 text-muted-foreground"
++                        >
++                          {microDialHint}
++                        </div>
++                      ) : null}
++                    </div>
+                   </div>
+                 </div>
+               </div>
+diff --git a/apps/web/src/components/ProjectScriptsControl.tsx b/apps/web/src/components/ProjectScriptsControl.tsx
+index 30492290..2af2d447 100644
+--- a/apps/web/src/components/ProjectScriptsControl.tsx
++++ b/apps/web/src/components/ProjectScriptsControl.tsx
+@@ -113,6 +113,7 @@ export default function ProjectScriptsControl({
+       command: fileScript.command,
+       icon: fileScript.icon ?? "play",
+       runOnWorktreeCreate: fileScript.runOnWorktreeCreate ?? false,
++      ...(fileScript.runOnThreadSettle ? { runOnThreadSettle: true } : {}),
+       keybinding: null,
+       previewUrl: fileScript.previewUrl ?? null,
+       autoOpenPreview: fileScript.previewUrl ? (fileScript.autoOpenPreview ?? false) : false,
+diff --git a/apps/web/src/components/chat/ChatComposer.tsx b/apps/web/src/components/chat/ChatComposer.tsx
+index 0a54a2a5..690657bc 100644
+--- a/apps/web/src/components/chat/ChatComposer.tsx
++++ b/apps/web/src/components/chat/ChatComposer.tsx
+@@ -1006,13 +1006,18 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
+                 size={size}
+                 className={size === "xs" ? undefined : "font-medium"}
+                 aria-label="Runtime mode"
++                data-micro-dial-control={props.hidden ? undefined : "permissions"}
+               />
+             }
+           >
+             <ComposerControlIcon icon={RuntimeModeIcon} size={size} />
+             <SelectValue>{runtimeModeOption.label}</SelectValue>
+           </TooltipTrigger>
+-          <SelectPopup alignItemWithTrigger={false} {...composerFloatingLayerProps}>
++          <SelectPopup
++            alignItemWithTrigger={false}
++            {...composerFloatingLayerProps}
++            data-micro-dial-popup="permissions"
++          >
+             {runtimeModeOptions.map((mode) => {
+               const option = runtimeModeConfig[mode];
+               const OptionIcon = option.icon;
+diff --git a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+index 039f12d4..e3a6926f 100644
+--- a/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
++++ b/apps/web/src/components/chat/CompactComposerControlsMenu.tsx
+@@ -40,12 +40,13 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+             variant="ghost"
+             className={size === "xs" ? "shrink-0" : "shrink-0 px-2"}
+             aria-label="More composer controls"
++            data-micro-dial-control={props.hidden ? undefined : "options"}
+           />
+         }
+       >
+         <ComposerControlIcon icon={EllipsisIcon} size={size} />
+       </MenuTrigger>
+-      <MenuPopup align="start" {...composerFloatingLayerProps}>
++      <MenuPopup align="start" {...composerFloatingLayerProps} data-micro-dial-popup="options">
+         {props.traitsMenuContent ? (
+           <>
+             {props.traitsMenuContent}
+@@ -62,8 +63,12 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+                 props.onToggleInteractionMode();
+               }}
+             >
+-              <MenuRadioItem value="default">Chat</MenuRadioItem>
+-              <MenuRadioItem value="plan">Plan</MenuRadioItem>
++              <MenuRadioItem value="default" closeOnClick>
++                Chat
++              </MenuRadioItem>
++              <MenuRadioItem value="plan" closeOnClick>
++                Plan
++              </MenuRadioItem>
+             </MenuRadioGroup>
+             <MenuDivider />
+           </>
+@@ -76,10 +81,18 @@ export const CompactComposerControlsMenu = memo(function CompactComposerControls
+             props.onRuntimeModeChange(value as RuntimeMode);
+           }}
+         >
+-          <MenuRadioItem value="approval-required">Supervised</MenuRadioItem>
+-          <MenuRadioItem value="auto-accept-edits">Auto-accept edits</MenuRadioItem>
+-          <MenuRadioItem value="auto">Auto</MenuRadioItem>
+-          <MenuRadioItem value="full-access">Full access</MenuRadioItem>
++          <MenuRadioItem value="approval-required" closeOnClick>
++            Supervised
++          </MenuRadioItem>
++          <MenuRadioItem value="auto-accept-edits" closeOnClick>
++            Auto-accept edits
++          </MenuRadioItem>
++          <MenuRadioItem value="auto" closeOnClick>
++            Auto
++          </MenuRadioItem>
++          <MenuRadioItem value="full-access" closeOnClick>
++            Full access
++          </MenuRadioItem>
+         </MenuRadioGroup>
+       </MenuPopup>
+     </Menu>
+diff --git a/apps/web/src/components/chat/DraftHeroHeadline.tsx b/apps/web/src/components/chat/DraftHeroHeadline.tsx
+index 98f9caa2..06815e8e 100644
+--- a/apps/web/src/components/chat/DraftHeroHeadline.tsx
++++ b/apps/web/src/components/chat/DraftHeroHeadline.tsx
+@@ -114,6 +114,7 @@ export function DraftHeroHeadline({
+           render={
+             <MenuTrigger
+               aria-label={hasResolvedProject ? "Change project" : "Choose a project"}
++              data-micro-dial-control={draftId ? "project" : undefined}
+               className="pointer-events-auto inline-block max-w-64 truncate border-foreground/60 border-b border-dotted align-baseline text-foreground transition-colors hover:border-foreground/80 focus-visible:rounded-sm focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+             />
+           }
+@@ -126,7 +127,11 @@ export function DraftHeroHeadline({
+           </TooltipPopup>
+         ) : null}
+       </Tooltip>
+-      <MenuPopup align="center" className="max-h-80 min-w-40! w-max max-w-64 overflow-y-auto">
++      <MenuPopup
++        align="center"
++        className="max-h-80 min-w-40! w-max max-w-64 overflow-y-auto"
++        data-micro-dial-popup={draftId ? "project" : undefined}
++      >
+         <MenuRadioGroup
+           value={activeProjectKey}
+           onValueChange={(value) => {
+diff --git a/apps/web/src/components/chat/MessagesTimeline.logic.test.ts b/apps/web/src/components/chat/MessagesTimeline.logic.test.ts
+index e1cf7f0d..81fa9400 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.logic.test.ts
++++ b/apps/web/src/components/chat/MessagesTimeline.logic.test.ts
+@@ -680,6 +680,35 @@ describe("expanded tool group scrolling", () => {
+ });
+ 
+ describe("work entry labels", () => {
++  it("keeps manual cleanup statuses visible with output available for expansion", () => {
++    const entries: WorkLogEntry[] = ["started", "completed", "failed", "skipped"].map(
++      (status, index) => ({
++        id: `cleanup-${status}`,
++        createdAt: `2026-09-01T12:00:0${index}Z`,
++        label: `Manual settle action ${status}`,
++        detail: '{"status":"ok","output":"long command output"}',
++        tone: status === "failed" ? "error" : "info",
++        sourceActivityKind: `settle-script.${status}`,
++      }),
++    );
++    const rows = deriveMessagesTimelineRows({
++      timelineEntries: deriveTimelineEntries([], [], entries),
++      latestTurn: null,
++      runningTurnId: null,
++      isWorking: false,
++      activeTurnStartedAt: null,
++      turnDiffSummaries: [],
++      supportsConversationRollback: false,
++    });
++    expect(rows.filter((row) => row.kind === "work").map((row) => row.groupedEntries)).toEqual(
++      entries.map((entry) => [entry]),
++    );
++    for (const entry of entries) {
++      expect(workEntryDisplayLabel(entry, undefined)).toBe(entry.label);
++      expect(liveWorkEntryLabel(entry, undefined, false)).toBe(entry.label);
++    }
++  });
++
+   const entry = {
+     id: "tool-1",
+     createdAt: "2026-09-01T12:00:00Z",
+diff --git a/apps/web/src/components/chat/MessagesTimeline.logic.ts b/apps/web/src/components/chat/MessagesTimeline.logic.ts
+index 08e4f8d2..8b5fe4d8 100644
+--- a/apps/web/src/components/chat/MessagesTimeline.logic.ts
++++ b/apps/web/src/components/chat/MessagesTimeline.logic.ts
+@@ -47,6 +47,7 @@ function singleToolCallLabel(entry: WorkLogEntry): string {
+ }
+ 
+ export function workEntryDisplayLabel(entry: WorkLogEntry, workspaceRoot: string | undefined) {
++  if (entry.sourceActivityKind?.startsWith("settle-script.")) return entry.label;
+   const toolPresentation = resolveWorkEntryToolPresentation(entry);
+   if (toolPresentation) return toolPresentation.displayName;
+   if (entry.command) return entry.command;
+@@ -1015,7 +1016,11 @@ export function deriveMessagesTimelineRows(input: {
+     }
+ 
+     if (timelineEntry.kind === "work") {
+-      if (timelineEntry.entry.agentSpawn !== undefined || timelineEntry.entry.tone === "error") {
++      if (
++        timelineEntry.entry.agentSpawn !== undefined ||
++        timelineEntry.entry.tone === "error" ||
++        timelineEntry.entry.sourceActivityKind?.startsWith("settle-script.")
++      ) {
+         nextRows.push({
+           kind: "work",
+           id: timelineEntry.id,
+@@ -1034,6 +1039,7 @@ export function deriveMessagesTimelineRows(input: {
+           nextEntry.kind !== "work" ||
+           nextEntry.entry.agentSpawn !== undefined ||
+           nextEntry.entry.sourceActivityKind === "context-compaction" ||
++          nextEntry.entry.sourceActivityKind?.startsWith("settle-script.") ||
+           nextEntry.entry.tone === "error" ||
+           activeWorkEntryIds.has(nextEntry.id) ||
+           collapsedEntryIds.has(nextEntry.id) ||
+diff --git a/apps/web/src/components/chat/ProviderModelPicker.tsx b/apps/web/src/components/chat/ProviderModelPicker.tsx
+index 932754db..40ab815f 100644
+--- a/apps/web/src/components/chat/ProviderModelPicker.tsx
++++ b/apps/web/src/components/chat/ProviderModelPicker.tsx
+@@ -170,6 +170,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+             variant={props.triggerVariant ?? "ghost"}
+             size={size}
+             data-chat-provider-model-picker="true"
++            data-micro-dial-control={props.isComposerOwned && !props.disabled ? "model" : undefined}
+             className={cn(
+               "min-w-0 justify-between whitespace-nowrap",
+               props.compact ? "max-w-42 shrink-0" : "max-w-48 shrink sm:max-w-56",
+@@ -222,6 +223,7 @@ export const ProviderModelPicker = memo(function ProviderModelPicker(props: {
+       </PopoverTrigger>
+       <PopoverPopup
+         {...(props.isComposerOwned ? composerFloatingLayerProps : {})}
++        data-micro-dial-popup={props.isComposerOwned ? "model" : undefined}
+         align="start"
+         className="before:hidden [--viewport-inline-padding:0]"
+         viewportClassName="overflow-hidden! rounded-[calc(var(--radius-lg)-1px)] p-0 [clip-path:inset(0_round_calc(var(--radius-lg)-1px))]"
+diff --git a/apps/web/src/components/chat/TraitsPicker.tsx b/apps/web/src/components/chat/TraitsPicker.tsx
+index 47ce59ef..3de5f620 100644
+--- a/apps/web/src/components/chat/TraitsPicker.tsx
++++ b/apps/web/src/components/chat/TraitsPicker.tsx
+@@ -558,7 +558,7 @@ export const TraitsPicker = memo(function TraitsPicker({
+     hidden?: boolean;
+   }) {
+   const [isMenuOpen, setIsMenuOpen] = useComposerMenuState(hidden);
+-  const { descriptors, primarySelectDescriptor, ultrathinkPromptControlled } =
++  const { descriptors, primarySelectDescriptor, ultrathinkPromptControlled, modelIsUnavailable } =
+     getTraitsSectionVisibility({
+       provider,
+       models,
+@@ -620,6 +620,9 @@ export const TraitsPicker = memo(function TraitsPicker({
+           <ComposerControl
+             variant={triggerVariant ?? "ghost"}
+             size={size}
++            data-micro-dial-control={
++              isComposerOwned && !hidden && !modelIsUnavailable ? "reasoning" : undefined
++            }
+             className={cn(
+               isCodexStyle
+                 ? "min-w-0 max-w-40 shrink justify-start overflow-hidden whitespace-nowrap sm:max-w-48"
+@@ -647,7 +650,11 @@ export const TraitsPicker = memo(function TraitsPicker({
+           </>
+         )}
+       </MenuTrigger>
+-      <MenuPopup align="start" {...(isComposerOwned ? composerFloatingLayerProps : {})}>
++      <MenuPopup
++        align="start"
++        {...(isComposerOwned ? composerFloatingLayerProps : {})}
++        data-micro-dial-popup={isComposerOwned && !modelIsUnavailable ? "reasoning" : undefined}
++      >
+         <TraitsMenuContent
+           provider={provider}
+           {...(instanceId ? { instanceId } : {})}
+diff --git a/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx b/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
+index 33663aef..91bed233 100644
+--- a/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
++++ b/apps/web/src/components/desktop/DesktopAppActivationCoordinator.tsx
+@@ -7,6 +7,7 @@ import { handleDesktopAppActivationRequest } from "../../desktopAppActivation";
+ import { useNewThreadHandler } from "../../hooks/useHandleNewThread";
+ import { findProjectByPath, inferProjectTitleFromPath } from "../../lib/projectPaths";
+ import { newProjectId } from "../../lib/utils";
++import { executeMicroControl } from "../../microControls";
+ import { readProjects, readThreadShell, waitForProject } from "../../state/entities";
+ import { useEnvironments, usePrimaryEnvironment } from "../../state/environments";
+ import { projectEnvironment } from "../../state/projects";
+@@ -36,6 +37,7 @@ export function DesktopAppActivationCoordinator() {
+ 
+   const processRequest = useEffectEvent(async (request: DesktopAppActivationRequest) =>
+     handleDesktopAppActivationRequest(request, {
++      executeMicroControl: (action) => document.hasFocus() && executeMicroControl(action),
+       isEnvironmentConnected: (environmentId) =>
+         environments.some(
+           (environment) =>
+diff --git a/apps/web/src/components/projectScriptEditor.tsx b/apps/web/src/components/projectScriptEditor.tsx
+index 4ffd4539..b224b2c5 100644
+--- a/apps/web/src/components/projectScriptEditor.tsx
++++ b/apps/web/src/components/projectScriptEditor.tsx
+@@ -78,6 +78,7 @@ export interface NewProjectScriptInput {
+   command: string;
+   icon: ProjectScriptIcon;
+   runOnWorktreeCreate: boolean;
++  runOnThreadSettle?: boolean;
+   keybinding: string | null;
+   /** Optional URL to open in the in-app preview when this script runs. */
+   previewUrl: string | null;
+@@ -116,6 +117,7 @@ export function editorRequestForScript(
+       command: script.command,
+       icon: script.icon,
+       runOnWorktreeCreate: script.runOnWorktreeCreate,
++      runOnThreadSettle: script.runOnThreadSettle ?? false,
+       keybinding: keybindingValueForCommand(keybindings, commandForProjectScript(script.id)),
+       previewUrl: script.previewUrl ?? null,
+       autoOpenPreview: script.autoOpenPreview ?? false,
+@@ -151,6 +153,7 @@ export function ProjectScriptEditorDialog({
+   const [icon, setIcon] = useState<ProjectScriptIcon>("play");
+   const [iconPickerOpen, setIconPickerOpen] = useState(false);
+   const [runOnWorktreeCreate, setRunOnWorktreeCreate] = useState(false);
++  const [runOnThreadSettle, setRunOnThreadSettle] = useState(false);
+   const [keybinding, setKeybinding] = useState("");
+   const [previewUrl, setPreviewUrl] = useState("");
+   const [autoOpenPreview, setAutoOpenPreview] = useState(false);
+@@ -168,6 +171,7 @@ export function ProjectScriptEditorDialog({
+     setIcon(request.initial.icon);
+     setIconPickerOpen(false);
+     setRunOnWorktreeCreate(request.initial.runOnWorktreeCreate);
++    setRunOnThreadSettle(request.initial.runOnThreadSettle ?? false);
+     setKeybinding(request.initial.keybinding ?? "");
+     setPreviewUrl(request.initial.previewUrl ?? "");
+     setAutoOpenPreview(request.initial.autoOpenPreview);
+@@ -219,6 +223,7 @@ export function ProjectScriptEditorDialog({
+         command: trimmedCommand,
+         icon,
+         runOnWorktreeCreate,
++        runOnThreadSettle,
+         keybinding: keybindingRule?.key ?? null,
+         previewUrl: trimmedPreviewUrl.length > 0 ? trimmedPreviewUrl : null,
+         autoOpenPreview: trimmedPreviewUrl.length > 0 ? autoOpenPreview : false,
+@@ -352,6 +357,21 @@ export function ProjectScriptEditorDialog({
+                   onCheckedChange={(checked) => setRunOnWorktreeCreate(Boolean(checked))}
+                 />
+               </label>
++              <label className="flex items-start justify-between gap-3 rounded-md border border-border/70 px-3 py-2 text-sm dark:border-transparent dark:bg-white/[0.035]">
++                <span className="grid gap-1">
++                  <span>Run when manually settling a worktree</span>
++                  <span className="text-xs text-muted-foreground">
++                    Runs this command once when you settle a worktree thread. Your command can
++                    delete runtime resources and data. Automatic settlement and shared active
++                    worktrees are skipped. Configure this on the project; machine defaults do not
++                    run on settle. Commands time out after two minutes.
++                  </span>
++                </span>
++                <Switch
++                  checked={runOnThreadSettle}
++                  onCheckedChange={(checked) => setRunOnThreadSettle(Boolean(checked))}
++                />
++              </label>
+               <label
+                 className={`flex items-center justify-between gap-3 rounded-md border border-border/70 px-3 py-2 text-sm dark:border-transparent dark:bg-white/[0.035] ${
+                   previewUrl.trim().length === 0 ? "opacity-60" : ""
+diff --git a/apps/web/src/components/settings/ProjectActionsList.tsx b/apps/web/src/components/settings/ProjectActionsList.tsx
+index 1794a5fd..484485db 100644
+--- a/apps/web/src/components/settings/ProjectActionsList.tsx
++++ b/apps/web/src/components/settings/ProjectActionsList.tsx
+@@ -43,6 +43,11 @@ export function ProjectActionsList({
+                 preview · desktop only
+               </span>
+             ) : null}
++            {script.runOnThreadSettle ? (
++              <span className="shrink-0 rounded-sm border border-border/60 px-1.5 py-px text-[11px] font-normal text-muted-foreground">
++                manual settle
++              </span>
++            ) : null}
+           </span>
+         }
+         description={<code className="block max-w-full truncate font-mono">{script.command}</code>}
+diff --git a/apps/web/src/components/settings/ProjectSettingsPanel.tsx b/apps/web/src/components/settings/ProjectSettingsPanel.tsx
+index f4ffe699..7d820a2b 100644
+--- a/apps/web/src/components/settings/ProjectSettingsPanel.tsx
++++ b/apps/web/src/components/settings/ProjectSettingsPanel.tsx
+@@ -758,6 +758,7 @@ function ProjectDetail({
+         command: fileScript.command,
+         icon: fileScript.icon ?? "play",
+         runOnWorktreeCreate: fileScript.runOnWorktreeCreate ?? false,
++        ...(fileScript.runOnThreadSettle ? { runOnThreadSettle: true } : {}),
+         keybinding: null,
+         previewUrl: fileScript.previewUrl ?? null,
+         autoOpenPreview: fileScript.previewUrl ? (fileScript.autoOpenPreview ?? false) : false,
+diff --git a/apps/web/src/desktopAppActivation.test.ts b/apps/web/src/desktopAppActivation.test.ts
+index 98c89c62..222ab9e6 100644
+--- a/apps/web/src/desktopAppActivation.test.ts
++++ b/apps/web/src/desktopAppActivation.test.ts
+@@ -1,4 +1,4 @@
+-import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
++import { EnvironmentId, ProjectId, ThreadId, type MicroControlAction } from "@t3tools/contracts";
+ import { describe, expect, it, vi } from "vite-plus/test";
+ 
+ import {
+@@ -22,6 +22,7 @@ function dependencies(
+   overrides: Partial<DesktopAppActivationDependencies> = {},
+ ): DesktopAppActivationDependencies {
+   return {
++    executeMicroControl: vi.fn(() => true),
+     isEnvironmentConnected: (id) => id === environmentId,
+     findThread: () => ({ projectId: existingProjectId }),
+     navigateThread: vi.fn(async () => undefined),
+@@ -39,6 +40,61 @@ function dependencies(
+ }
+ 
+ describe("desktop app activation", () => {
++  it.each<MicroControlAction>([
++    "dial-clockwise",
++    "dial-counterclockwise",
++    "dial-press",
++    "composer-toggle",
++    "new-thread",
++    "new-project",
++    "latest-message",
++    "settle-thread",
++    "terminal-toggle",
++    "command-palette",
++  ])("dispatches %s and acknowledges the same accepted action", async (action) => {
++    const deps = dependencies({ getTarget: () => null });
++    const response = await handleDesktopAppActivationRequest(
++      { version: 1, requestId: "micro-1", type: "micro-control", action },
++      deps,
++    );
++
++    expect(response).toEqual({ version: 1, requestId: "micro-1", ok: true, action });
++    expect(deps.executeMicroControl).toHaveBeenCalledWith(action);
++    expect(deps.navigateThread).not.toHaveBeenCalled();
++    expect(deps.createProject).not.toHaveBeenCalled();
++    expect(deps.openThread).not.toHaveBeenCalled();
++  });
++
++  it("rejects Micro controls when the renderer has no focused active chat", async () => {
++    const response = await handleDesktopAppActivationRequest(
++      { version: 1, requestId: "micro-1", type: "micro-control", action: "dial-press" },
++      dependencies({ executeMicroControl: () => false }),
++    );
++
++    expect(response).toMatchObject({
++      requestId: "micro-1",
++      ok: false,
++      code: "micro-control-unavailable",
++    });
++  });
++
++  it("reports a failed Micro handler without acknowledging the action", async () => {
++    const response = await handleDesktopAppActivationRequest(
++      { version: 1, requestId: "micro-1", type: "micro-control", action: "dial-press" },
++      dependencies({
++        executeMicroControl: () => {
++          throw new Error("Control failed.");
++        },
++      }),
++    );
++
++    expect(response).toMatchObject({
++      ok: false,
++      code: "internal-error",
++      message: "Control failed.",
++    });
++  });
++
+   const openExisting = {
+     version: 1,
+     requestId: "open-existing",
+diff --git a/apps/web/src/desktopAppActivation.ts b/apps/web/src/desktopAppActivation.ts
+index acad574d..46fedce7 100644
+--- a/apps/web/src/desktopAppActivation.ts
++++ b/apps/web/src/desktopAppActivation.ts
+@@ -4,6 +4,7 @@ import type {
+   DesktopAppActivationResponse,
+   EnvironmentId,
+   ExecutionEnvironmentPlatformOs,
++  MicroControlAction,
+   ProjectId,
+   ScopedProjectRef,
+   ScopedThreadRef,
+@@ -22,6 +23,7 @@ export interface DesktopAppActivationTarget {
+ }
+ 
+ export interface DesktopAppActivationDependencies {
++  readonly executeMicroControl: (action: MicroControlAction) => boolean;
+   readonly isEnvironmentConnected: (environmentId: EnvironmentId) => boolean;
+   readonly findThread: (ref: ScopedThreadRef) => { readonly projectId: ProjectId } | null;
+   readonly navigateThread: (ref: ScopedThreadRef) => Promise<void>;
+@@ -62,6 +64,24 @@ export async function handleDesktopAppActivationRequest(
+   request: DesktopAppActivationRequest,
+   dependencies: DesktopAppActivationDependencies,
+ ): Promise<DesktopAppActivationResponse> {
++  if (request.type === "micro-control") {
++    try {
++      if (!dependencies.executeMicroControl(request.action)) {
++        return failure(
++          request.requestId,
++          "micro-control-unavailable",
++          "Focus an active chat in T3 Code before using Micro controls.",
++        );
++      }
++      return { version: 1, requestId: request.requestId, ok: true, action: request.action };
++    } catch (error) {
++      return failure(
++        request.requestId,
++        "internal-error",
++        errorMessage(error, "T3 Code could not execute the Micro control."),
++      );
++    }
++  }
+   if (request.type === "open-thread") {
+     const ref = { environmentId: request.environmentId, threadId: request.threadId };
+     if (!dependencies.isEnvironmentConnected(ref.environmentId)) {
+diff --git a/apps/web/src/hooks/useMicroControls.ts b/apps/web/src/hooks/useMicroControls.ts
+new file mode 100644
+index 00000000..962f84db
+--- /dev/null
++++ b/apps/web/src/hooks/useMicroControls.ts
+@@ -0,0 +1,273 @@
++import { useEffect, useEffectEvent, useState } from "react";
++import { flushSync } from "react-dom";
++
++import { createMicroDialController, registerMicroControlHandler } from "../microControls";
++import { isTerminalFocused } from "../lib/terminalFocus";
++
++const CONTROL_LABELS = new Map([
++  ["project", "Project"],
++  ["environment", "Environment"],
++  ["workspace", "Workspace"],
++  ["branch", "Source branch"],
++  ["model", "Model"],
++  ["reasoning", "Reasoning"],
++  ["permissions", "Permissions"],
++  ["options", "Model and permissions"],
++]);
++const CONTROL_SELECTOR = "[data-micro-dial-control]";
++const POPUP_SELECTOR = "[data-micro-dial-popup]";
++const EDITOR_SELECTOR = '[data-testid="composer-editor"][contenteditable="true"]';
++
++function visible(element: HTMLElement): boolean {
++  return (
++    element.getClientRects().length > 0 &&
++    !element.closest(
++      '[hidden], [inert], [aria-hidden="true"], [data-ending-style], [data-chat-column-maximized-away="true"]',
++    ) &&
++    getComputedStyle(element).visibility !== "hidden"
++  );
++}
++
++function available(element: HTMLElement): boolean {
++  return visible(element) && !element.matches(':disabled, [aria-disabled="true"], [data-disabled]');
++}
++
++export function useMicroControls(options: {
++  scope: string | null;
++  root: HTMLDivElement | null;
++  focusComposer: () => void;
++  scroll: (direction: -1 | 1) => void;
++  latest: () => void;
++  settleThread: () => boolean;
++  toggleTerminal: () => boolean;
++}) {
++  const [hint, updateHint] = useState<{ scope: string | null; text: string } | null>(null);
++  const focusComposer = useEffectEvent(options.focusComposer);
++  const scroll = useEffectEvent(options.scroll);
++  const latest = useEffectEvent(options.latest);
++  const settleThread = useEffectEvent(options.settleThread);
++  const toggleTerminal = useEffectEvent(options.toggleTerminal);
++
++  useEffect(() => {
++    const element = options.root;
++    if (!element) return;
++    const root = element;
++    const setHint = (text: string | null) =>
++      updateHint((previous) =>
++        text === null
++          ? null
++          : previous?.scope === options.scope && previous.text === text
++            ? previous
++            : { scope: options.scope, text },
++      );
++    let disposed = false;
++    let blurFrame: number | null = null;
++
++    function controls() {
++      const candidates = Array.from(root.querySelectorAll<HTMLElement>(CONTROL_SELECTOR)).filter(
++        available,
++      );
++      // A resting and expanded trigger can coexist during composer transitions.
++      return Array.from(CONTROL_LABELS.keys()).flatMap((id) => {
++        const control = candidates.find((candidate) => candidate.dataset.microDialControl === id);
++        return control ? [control] : [];
++      });
++    }
++
++    function popup(): HTMLElement | null {
++      const ids = new Set(
++        Array.from(
++          root.querySelectorAll<HTMLElement>(CONTROL_SELECTOR),
++          (control) => control.dataset.microDialControl,
++        ),
++      );
++      return (
++        Array.from(document.querySelectorAll<HTMLElement>(POPUP_SELECTOR)).find(
++          (candidate) => ids.has(candidate.dataset.microDialPopup) && visible(candidate),
++        ) ?? null
++      );
++    }
++
++    function keyboardTarget(menu: HTMLElement): HTMLElement {
++      const combobox = menu.querySelector<HTMLElement>('[role="combobox"]');
++      if (combobox) return combobox;
++      const active = document.activeElement;
++      if (active instanceof HTMLElement && menu.contains(active)) return active;
++      return (
++        menu.querySelector<HTMLElement>(
++          '[role="combobox"], [role="option"][tabindex="0"], [role="menuitemradio"][tabindex="0"], [role="menu"], [role="listbox"]',
++        ) ?? menu
++      );
++    }
++
++    function pickerKey(key: "ArrowDown" | "ArrowUp" | "Enter" | "Escape") {
++      const menu = popup();
++      if (!menu) return;
++      const target = keyboardTarget(menu);
++      // Use each picker's keyboard path, including its virtual list and disabled options.
++      flushSync(() => {
++        target.dispatchEvent(
++          new KeyboardEvent("keydown", { key, code: key, bubbles: true, cancelable: true }),
++        );
++      });
++      if (target.isConnected) {
++        target.dispatchEvent(
++          new KeyboardEvent("keyup", { key, code: key, bubbles: true, cancelable: true }),
++        );
++      }
++    }
++
++    function clearHighlight() {
++      for (const element of root.querySelectorAll<HTMLElement>("[data-micro-dial-highlighted]")) {
++        delete element.dataset.microDialHighlighted;
++      }
++    }
++
++    function blur() {
++      const active = document.activeElement;
++      if (
++        active instanceof HTMLElement &&
++        (root.contains(active) || active.closest(POPUP_SELECTOR))
++      ) {
++        active.blur();
++      }
++      // Keep Base UI's close-focus restoration from reentering settings mode.
++      root.focus({ preventScroll: true });
++    }
++
++    function leaveSettings() {
++      if (blurFrame !== null) window.cancelAnimationFrame(blurFrame);
++      blur();
++      blurFrame = window.requestAnimationFrame(() => {
++        if (!disposed) {
++          blur();
++          controller.focusChanged(false);
++        }
++        blurFrame = null;
++      });
++      setHint("Dial: scroll · Press for latest message");
++    }
++
++    const controller = createMicroDialController({
++      getControls: () => controls().flatMap((control) => control.dataset.microDialControl ?? []),
++      getOpenPicker: () => popup()?.dataset.microDialPopup ?? null,
++      highlight: (id) => {
++        clearHighlight();
++        const control = controls().find((candidate) => candidate.dataset.microDialControl === id);
++        if (control) {
++          control.dataset.microDialHighlighted = "true";
++          setHint(`${CONTROL_LABELS.get(id ?? "") ?? "Settings"} · Press to choose`);
++        } else {
++          setHint(null);
++        }
++      },
++      openPicker: (id) => {
++        const control = controls().find((candidate) => candidate.dataset.microDialControl === id);
++        if (!control) return;
++        flushSync(() => control.click());
++        setHint(`${CONTROL_LABELS.get(id) ?? "Settings"} · Turn to choose · Press to confirm`);
++      },
++      movePicker: (direction) => pickerKey(direction === 1 ? "ArrowDown" : "ArrowUp"),
++      confirmPicker: () => {
++        pickerKey("Enter");
++        if (!popup()) {
++          focusComposer();
++          setHint("Turn to choose a setting · Down to scroll");
++        }
++      },
++      closePicker: () => {
++        // Suppress focus events throughout the synchronous close and delayed restoration.
++        if (blurFrame === null)
++          blurFrame = window.requestAnimationFrame(() => {
++            blurFrame = null;
++          });
++        pickerKey("Escape");
++      },
++      focusComposer: () => {
++        if (blurFrame !== null) {
++          window.cancelAnimationFrame(blurFrame);
++          blurFrame = null;
++        }
++        focusComposer();
++        const editor = root.querySelector<HTMLElement>(EDITOR_SELECTOR);
++        if (!editor || !available(editor)) controls()[0]?.focus({ preventScroll: true });
++        setHint("Turn to choose a setting · Down to scroll");
++      },
++      blurComposer: leaveSettings,
++      scroll: (direction) => {
++        scroll(direction);
++        setHint("Dial: scroll · Press for latest message");
++      },
++      latest: () => {
++        latest();
++        setHint("Latest message · Down to focus chat");
++      },
++    });
++
++    function isSettingsTarget(target: EventTarget | null): boolean {
++      return (
++        target instanceof Element &&
++        ((root.contains(target) && !!target.closest(`${EDITOR_SELECTOR}, ${CONTROL_SELECTOR}`)) ||
++          (popup()?.contains(target) ?? false))
++      );
++    }
++
++    function onFocus(event: FocusEvent) {
++      if (blurFrame !== null) return;
++      controller.focusChanged(isSettingsTarget(event.target));
++    }
++
++    function onBlur() {
++      queueMicrotask(() => {
++        if (!disposed && blurFrame === null)
++          controller.focusChanged(isSettingsTarget(document.activeElement));
++      });
++    }
++
++    controller.focusChanged(isSettingsTarget(document.activeElement));
++    document.addEventListener("focusin", onFocus);
++    document.addEventListener("focusout", onBlur);
++    const unregister = registerMicroControlHandler((action) => {
++      if (disposed || !document.hasFocus() || (!visible(root) && !popup())) return false;
++      // Do not reinterpret hardware input inside unrelated dialogs or the terminal.
++      const active = document.activeElement;
++      if (
++        active instanceof Element &&
++        active.closest('[role="dialog"], [role="alertdialog"]') &&
++        !popup()?.contains(active)
++      )
++        return false;
++      if (isTerminalFocused()) return action === "terminal-toggle" && toggleTerminal();
++      if (
++        active instanceof Element &&
++        !root.contains(active) &&
++        !popup()?.contains(active) &&
++        active !== document.body
++      )
++        return false;
++      switch (action) {
++        case "latest-message":
++          latest();
++          setHint("Latest message · Down to focus chat");
++          return true;
++        case "settle-thread":
++          return settleThread();
++        case "terminal-toggle":
++          return toggleTerminal();
++        default:
++          return controller.handle(action);
++      }
++    });
++
++    return () => {
++      disposed = true;
++      unregister();
++      document.removeEventListener("focusin", onFocus);
++      document.removeEventListener("focusout", onBlur);
++      if (blurFrame !== null) window.cancelAnimationFrame(blurFrame);
++      clearHighlight();
++    };
++  }, [options.scope, options.root]);
++
++  return hint?.scope === options.scope ? hint.text : null;
++}
+diff --git a/apps/web/src/index.css b/apps/web/src/index.css
+index 45d10f28..919bf906 100644
+--- a/apps/web/src/index.css
++++ b/apps/web/src/index.css
+@@ -2052,3 +2052,9 @@ code {
+     transform: scaleX(0.9);
+   }
+ }
++/* The dial highlights controls without moving the text cursor out of the composer. */
++[data-micro-dial-highlighted="true"] {
++  outline: 2px solid var(--color-ring);
++  outline-offset: 3px;
++  border-radius: 6px;
++}
+diff --git a/apps/web/src/microControls.test.ts b/apps/web/src/microControls.test.ts
+new file mode 100644
+index 00000000..58aa7bf2
+--- /dev/null
++++ b/apps/web/src/microControls.test.ts
+@@ -0,0 +1,224 @@
++import { describe, expect, it } from "vite-plus/test";
++
++import {
++  createMicroDialController,
++  registerMicroControlHandler,
++  registerGlobalMicroControlHandler,
++  executeMicroControl,
++} from "./microControls";
++
++function workspace() {
++  let controls = ["project", "workspace", "branch", "model", "reasoning", "permissions"];
++  let highlighted: string | null = null;
++  let picker: string | null = null;
++  let pending = 0;
++  let selected = 0;
++  let scroll = 0;
++  let atLatest = false;
++  let focused = false;
++  const controller = createMicroDialController({
++    getControls: () => controls,
++    getOpenPicker: () => picker,
++    highlight: (id) => {
++      highlighted = id;
++    },
++    openPicker: (id) => {
++      picker = id;
++      pending = selected;
++    },
++    movePicker: (direction) => {
++      pending += direction;
++    },
++    confirmPicker: () => {
++      selected = pending;
++      picker = null;
++    },
++    closePicker: () => {
++      picker = null;
++      pending = selected;
++    },
++    focusComposer: () => {
++      focused = true;
++    },
++    blurComposer: () => {
++      focused = false;
++    },
++    scroll: (direction) => {
++      scroll += direction;
++    },
++    latest: () => {
++      atLatest = true;
++    },
++  });
++  return {
++    controller,
++    state: () => ({ highlighted, picker, pending, selected, scroll, atLatest, focused }),
++    setControls: (next: string[]) => {
++      controls = next;
++    },
++  };
++}
++
++describe("Micro dial navigation", () => {
++  it("scrolls and returns to latest while the composer is unfocused", () => {
++    const app = workspace();
++    app.controller.handle("dial-clockwise");
++    app.controller.handle("dial-clockwise");
++    app.controller.handle("dial-counterclockwise");
++    app.controller.handle("dial-press");
++    expect(app.state()).toMatchObject({ scroll: 1, atLatest: true, selected: 0, picker: null });
++  });
++
++  it("requires opening a control and confirming a list item before changing a setting", () => {
++    const app = workspace();
++    app.controller.focusChanged(true);
++    app.controller.handle("dial-clockwise");
++    expect(app.state()).toMatchObject({ highlighted: "project", picker: null, scroll: 0 });
++    app.controller.handle("dial-press");
++    app.controller.handle("dial-clockwise");
++    app.controller.handle("dial-clockwise");
++    expect(app.state()).toMatchObject({ picker: "project", selected: 0, pending: 2 });
++    app.controller.handle("dial-press");
++    expect(app.state()).toMatchObject({ picker: null, selected: 2 });
++    app.controller.handle("dial-clockwise");
++    expect(app.state().highlighted).toBe("workspace");
++  });
++
++  it("keeps picker mode when the input blurs into its open menu", () => {
++    const app = workspace();
++    app.controller.focusChanged(true);
++    app.controller.handle("dial-press");
++    app.controller.focusChanged(false);
++    app.controller.handle("dial-clockwise");
++    expect(app.state()).toMatchObject({ scroll: 0, pending: 1, picker: "project" });
++  });
++
++  it("joystick down cancels a pending choice and subsequent rotation scrolls", () => {
++    const app = workspace();
++    app.controller.handle("composer-toggle");
++    app.controller.handle("dial-press");
++    app.controller.handle("dial-clockwise");
++    app.controller.handle("composer-toggle");
++    app.controller.handle("dial-clockwise");
++    expect(app.state()).toMatchObject({
++      focused: false,
++      selected: 0,
++      pending: 0,
++      picker: null,
++      highlighted: null,
++      scroll: 1,
++    });
++    app.controller.handle("composer-toggle");
++    expect(app.state().focused).toBe(true);
++  });
++
++  it("preserves confirmed choices and rechecks available controls after a model change", () => {
++    const app = workspace();
++    app.setControls(["model", "reasoning", "permissions"]);
++    app.controller.focusChanged(true);
++    app.controller.handle("dial-press");
++    app.controller.handle("dial-clockwise");
++    app.controller.handle("dial-press");
++    app.setControls(["model", "permissions"]);
++    app.controller.handle("dial-clockwise");
++    expect(app.state()).toMatchObject({ highlighted: "permissions", selected: 1 });
++    app.controller.handle("composer-toggle");
++    expect(app.state().selected).toBe(1);
++  });
++
++  it("clears stale highlights when the selected control disappears", () => {
++    const app = workspace();
++    app.setControls(["reasoning"]);
++    app.controller.focusChanged(true);
++    app.controller.handle("dial-clockwise");
++    app.setControls([]);
++    app.controller.handle("dial-press");
++    expect(app.state()).toMatchObject({ highlighted: null, picker: null, atLatest: false });
++  });
++
++  it("returns to scrolling after a normal focus change outside settings", () => {
++    const app = workspace();
++    app.controller.focusChanged(true);
++    app.controller.handle("dial-clockwise");
++    app.controller.focusChanged(false);
++    app.controller.handle("dial-press");
++    expect(app.state()).toMatchObject({ highlighted: null, atLatest: true, picker: null });
++  });
++});
++
++describe("Micro command registration", () => {
++  it("rejects events after the chat unmounts and protects its replacement from stale cleanup", () => {
++    expect(executeMicroControl("dial-press")).toBe(false);
++    const old = workspace();
++    const removeOld = registerMicroControlHandler(
++      (action) => action === "dial-clockwise" && old.controller.handle(action),
++    );
++    const next = workspace();
++    const removeNext = registerMicroControlHandler(
++      (action) => action === "dial-clockwise" && next.controller.handle(action),
++    );
++    removeOld();
++    expect(executeMicroControl("dial-clockwise")).toBe(true);
++    expect(old.state().scroll).toBe(0);
++    expect(next.state().scroll).toBe(1);
++    removeNext();
++    expect(executeMicroControl("dial-press")).toBe(false);
++  });
++
++  it("opens global actions without a chat and keeps thread actions unavailable after unmount", () => {
++    const delivered: string[] = [];
++    const removeGlobal = registerGlobalMicroControlHandler((action) => {
++      delivered.push(action);
++      return true;
++    });
++    try {
++      expect(executeMicroControl("new-project")).toBe(true);
++      expect(executeMicroControl("new-thread")).toBe(true);
++      expect(executeMicroControl("command-palette")).toBe(true);
++      expect(executeMicroControl("settle-thread")).toBe(false);
++      const removeChat = registerMicroControlHandler((action) => {
++        delivered.push(action);
++        return true;
++      });
++      expect(executeMicroControl("latest-message")).toBe(true);
++      expect(executeMicroControl("terminal-toggle")).toBe(true);
++      removeChat();
++      expect(executeMicroControl("latest-message")).toBe(false);
++      expect(executeMicroControl("terminal-toggle")).toBe(false);
++      expect(executeMicroControl("command-palette")).toBe(true);
++      expect(delivered).toEqual([
++        "new-project",
++        "new-thread",
++        "command-palette",
++        "latest-message",
++        "terminal-toggle",
++        "command-palette",
++      ]);
++    } finally {
++      removeGlobal();
++    }
++  });
++
++  it("does not reroute rejected chat actions to a global handler", () => {
++    const delivered: string[] = [];
++    const removeGlobal = registerGlobalMicroControlHandler((action) => {
++      delivered.push(action);
++      return true;
++    });
++    const removeChat = registerMicroControlHandler(() => false);
++    expect(executeMicroControl("settle-thread")).toBe(false);
++    expect(executeMicroControl("composer-toggle")).toBe(false);
++    expect(delivered).toEqual([]);
++    removeChat();
++    removeGlobal();
++  });
++
++  it("protects a replacement global handler from stale cleanup", () => {
++    const removeOld = registerGlobalMicroControlHandler(() => false);
++    const removeNext = registerGlobalMicroControlHandler(() => true);
++    removeOld();
++    expect(executeMicroControl("new-thread")).toBe(true);
++    removeNext();
++    expect(executeMicroControl("new-thread")).toBe(false);
++  });
++});
+diff --git a/apps/web/src/microControls.ts b/apps/web/src/microControls.ts
+new file mode 100644
+index 00000000..2d5c1bed
+--- /dev/null
++++ b/apps/web/src/microControls.ts
+@@ -0,0 +1,131 @@
++import type { MicroControlAction, MicroDialAction } from "@t3tools/contracts";
++
++export type MicroGlobalAction = Extract<
++  MicroControlAction,
++  "new-thread" | "new-project" | "command-palette"
++>;
++export type MicroChatAction = Exclude<MicroControlAction, MicroGlobalAction>;
++type MicroControlHandler = (action: MicroChatAction) => boolean;
++let activeHandler: MicroControlHandler | null = null;
++let globalHandler: ((action: MicroGlobalAction) => boolean) | null = null;
++
++export function registerMicroControlHandler(handler: MicroControlHandler): () => void {
++  activeHandler = handler;
++  return () => {
++    if (activeHandler === handler) activeHandler = null;
++  };
++}
++
++export function executeMicroControl(action: MicroControlAction): boolean {
++  switch (action) {
++    case "new-thread":
++    case "new-project":
++    case "command-palette":
++      return globalHandler?.(action) ?? false;
++    default:
++      return activeHandler?.(action) ?? false;
++  }
++}
++
++export function registerGlobalMicroControlHandler(
++  handler: (action: MicroGlobalAction) => boolean,
++): () => void {
++  globalHandler = handler;
++  return () => {
++    if (globalHandler === handler) globalHandler = null;
++  };
++}
++
++export interface MicroDialHost {
++  getControls: () => readonly string[];
++  getOpenPicker: () => string | null;
++  highlight: (id: string | null) => void;
++  openPicker: (id: string) => void;
++  movePicker: (direction: -1 | 1) => void;
++  confirmPicker: () => void;
++  closePicker: () => void;
++  focusComposer: () => void;
++  blurComposer: () => void;
++  scroll: (direction: -1 | 1) => void;
++  latest: () => void;
++}
++
++export function createMicroDialController(host: MicroDialHost) {
++  let state: { kind: "reading" } | { kind: "settings"; highlighted: string | null } = {
++    kind: "reading",
++  };
++
++  function focusChanged(inSettings: boolean) {
++    if (inSettings) {
++      if (state.kind === "reading") state = { kind: "settings", highlighted: null };
++    } else if (host.getOpenPicker() === null) {
++      state = { kind: "reading" };
++      host.highlight(null);
++    }
++  }
++
++  function handle(action: MicroDialAction): boolean {
++    const picker = host.getOpenPicker();
++    if (picker !== null) state = { kind: "settings", highlighted: picker };
++
++    if (action === "composer-toggle") {
++      if (state.kind === "reading") {
++        state = { kind: "settings", highlighted: null };
++        host.focusComposer();
++      } else {
++        host.closePicker();
++        state = { kind: "reading" };
++        host.highlight(null);
++        host.blurComposer();
++      }
++      return true;
++    }
++
++    switch (action) {
++      case "dial-clockwise":
++      case "dial-counterclockwise": {
++        const direction = action === "dial-clockwise" ? 1 : -1;
++        if (picker !== null) {
++          host.movePicker(direction);
++        } else if (state.kind === "reading") {
++          host.scroll(direction);
++        } else {
++          const controls = host.getControls();
++          const index = state.highlighted === null ? -1 : controls.indexOf(state.highlighted);
++          const next =
++            index < 0
++              ? direction === 1
++                ? 0
++                : controls.length - 1
++              : (index + direction + controls.length) % controls.length;
++          state.highlighted = controls[next] ?? null;
++          host.highlight(state.highlighted);
++        }
++        return true;
++      }
++      case "dial-press": {
++        if (picker !== null) {
++          host.confirmPicker();
++        } else if (state.kind === "reading") {
++          host.latest();
++        } else {
++          const controls = host.getControls();
++          const selected =
++            state.highlighted !== null && controls.includes(state.highlighted)
++              ? state.highlighted
++              : (controls[0] ?? null);
++          state.highlighted = selected;
++          host.highlight(selected);
++          if (selected !== null) host.openPicker(selected);
++        }
++        return true;
++      }
++      default: {
++        const unhandled: never = action;
++        return unhandled;
++      }
++    }
++  }
++
++  return { handle, focusChanged };
++}
+diff --git a/apps/web/src/projectScripts.test.ts b/apps/web/src/projectScripts.test.ts
+index 1f7a6bfa..7ba2bb4c 100644
+--- a/apps/web/src/projectScripts.test.ts
++++ b/apps/web/src/projectScripts.test.ts
+@@ -1,8 +1,10 @@
++import { ProjectId } from "@t3tools/contracts";
+ import { describe, expect, it } from "vite-plus/test";
+ import {
+   projectScriptCwd,
+   projectScriptRuntimeEnv,
+   setupProjectScript,
++  settleProjectScripts,
+ } from "@t3tools/shared/projectScripts";
+ 
+ import {
+@@ -14,6 +16,45 @@ import {
+ } from "./projectScripts";
+ 
+ describe("projectScripts helpers", () => {
++  it("keeps settle actions explicitly opted in and out of the default run action", () => {
++    const cleanup = buildProjectScript("cleanup", {
++      name: "Cleanup",
++      command: "cleanup",
++      icon: "configure",
++      runOnWorktreeCreate: false,
++      runOnThreadSettle: true,
++      previewUrl: null,
++      autoOpenPreview: false,
++    });
++    const ordinary = buildProjectScript("test", {
++      name: "Test",
++      command: "test",
++      icon: "test",
++      runOnWorktreeCreate: false,
++      runOnThreadSettle: false,
++      previewUrl: null,
++      autoOpenPreview: false,
++    });
++    expect(cleanup.runOnThreadSettle).toBe(true);
++    expect(ordinary.runOnThreadSettle).toBeUndefined();
++    expect(primaryProjectScript([cleanup, ordinary])).toBe(ordinary);
++    expect(primaryProjectScript([cleanup])).toBeNull();
++    const project = { id: ProjectId.make("project"), scripts: [cleanup] };
++    expect(settleProjectScripts({ projectScriptOverrides: {} }, project)).toEqual([cleanup]);
++    expect(
++      settleProjectScripts({ projectScriptOverrides: { [project.id]: null } }, project),
++    ).toEqual([]);
++    expect(
++      settleProjectScripts({ projectScriptOverrides: { [project.id]: [ordinary] } }, project),
++    ).toEqual([]);
++    expect(
++      settleProjectScripts(
++        { projectScriptOverrides: { [project.id]: [cleanup] } },
++        { ...project, scripts: [] },
++      ),
++    ).toEqual([cleanup]);
++  });
++
+   it("builds scripts with preview settings", () => {
+     expect(
+       buildProjectScript("dev", {
+diff --git a/apps/web/src/projectScripts.ts b/apps/web/src/projectScripts.ts
+index e3efc9e3..ebea57a1 100644
+--- a/apps/web/src/projectScripts.ts
++++ b/apps/web/src/projectScripts.ts
+@@ -12,6 +12,7 @@ export interface ProjectScriptInput {
+   readonly command: ProjectScript["command"];
+   readonly icon: ProjectScript["icon"];
+   readonly runOnWorktreeCreate: ProjectScript["runOnWorktreeCreate"];
++  readonly runOnThreadSettle?: boolean;
+   readonly previewUrl: Exclude<ProjectScript["previewUrl"], undefined> | null;
+   readonly autoOpenPreview: boolean;
+ }
+@@ -23,6 +24,7 @@ export function buildProjectScript(id: string, input: ProjectScriptInput): Proje
+     command: input.command,
+     icon: input.icon,
+     runOnWorktreeCreate: input.runOnWorktreeCreate,
++    ...(input.runOnThreadSettle ? { runOnThreadSettle: true } : {}),
+     ...(input.previewUrl === null
+       ? {}
+       : {
+@@ -82,6 +84,8 @@ export function nextProjectScriptId(name: string, existingIds: Iterable<string>)
+ }
+ 
+ export function primaryProjectScript(scripts: ReadonlyArray<ProjectScript>): ProjectScript | null {
+-  const regular = scripts.find((script) => !script.runOnWorktreeCreate);
+-  return regular ?? scripts[0] ?? null;
++  const regular = scripts.find(
++    (script) => !script.runOnWorktreeCreate && !script.runOnThreadSettle,
++  );
++  return regular ?? scripts.find((script) => !script.runOnThreadSettle) ?? null;
+ }
+diff --git a/apps/web/src/routes/_chat.tsx b/apps/web/src/routes/_chat.tsx
+index e084e22c..34bc6375 100644
+--- a/apps/web/src/routes/_chat.tsx
++++ b/apps/web/src/routes/_chat.tsx
+@@ -1,6 +1,6 @@
+ import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
+ import { useAtomValue } from "@effect/atom-react";
+-import { useEffect, useMemo } from "react";
++import { useCallback, useEffect, useEffectEvent, useMemo } from "react";
+ 
+ import { isCommandPaletteOpen } from "../commandPaletteBus";
+ import { useClientSettings, useLegacySidebarEnabled } from "../hooks/useSettings";
+@@ -11,7 +11,8 @@ import { selectProjectGroupingSettings } from "../logicalProject";
+ import { buildSidebarProjectSnapshots } from "../sidebarProjectGrouping";
+ import { dispatchPreviewAction } from "../components/preview/previewActionBus";
+ import { useHandleNewThread } from "../hooks/useHandleNewThread";
+-import { startNewThreadFromContext } from "../lib/chatThreadActions";
++import { resolveThreadActionProjectRef, startNewThreadFromContext } from "../lib/chatThreadActions";
++import { registerGlobalMicroControlHandler, type MicroGlobalAction } from "../microControls";
+ import { isPreviewFocused } from "../lib/previewFocus";
+ import { isTerminalFocused } from "../lib/terminalFocus";
+ import { resolveShortcutCommand } from "../keybindings";
+@@ -55,6 +56,60 @@ function ChatRouteGlobalShortcuts() {
+       ? selectActiveRightPanel(state.byThreadKey, routeThreadRef) === "preview"
+       : false,
+   );
++  const startNewThread = useCallback(() => {
++    if (!legacySidebarEnabled && projectGroupCount > 1) {
++      openCommandPalette({ open: "new-thread-in" });
++      return true;
++    }
++    const context = {
++      activeDraftThread,
++      activeThread: activeThread ?? undefined,
++      defaultProjectRef,
++      handleNewThread,
++    };
++    if (resolveThreadActionProjectRef(context) === null) return false;
++    void startNewThreadFromContext(context);
++    return true;
++  }, [
++    activeDraftThread,
++    activeThread,
++    defaultProjectRef,
++    handleNewThread,
++    legacySidebarEnabled,
++    projectGroupCount,
++  ]);
++  const handleGlobalMicroAction = useEffectEvent((action: MicroGlobalAction) => {
++    if (!document.hasFocus()) return false;
++    if (
++      Array.from(
++        document.querySelectorAll<HTMLElement>('[role="dialog"], [role="alertdialog"]'),
++      ).some(
++        (dialog) =>
++          dialog.getClientRects().length > 0 &&
++          !dialog.closest('[hidden], [inert], [aria-hidden="true"]'),
++      )
++    )
++      return false;
++    switch (action) {
++      case "new-thread":
++        return startNewThread();
++      case "new-project":
++        openCommandPalette({ open: "add-project" });
++        return true;
++      case "command-palette":
++        openCommandPalette();
++        return true;
++      default: {
++        const unhandled: never = action;
++        return unhandled;
++      }
++    }
++  });
++  useEffect(
++    () => registerGlobalMicroControlHandler((action) => handleGlobalMicroAction(action)),
++    [],
++  );
++
+   useEffect(() => {
+     const onWindowKeyDown = (event: KeyboardEvent) => {
+       if (event.defaultPrevented) return;
+@@ -95,16 +150,7 @@ function ChatRouteGlobalShortcuts() {
+         // The default sidebar routes creation through the command palette
+         // whenever there is a real choice to make; the legacy sidebar (and
+         // single-project setups) keep the immediate contextual create.
+-        if (!legacySidebarEnabled && projectGroupCount > 1) {
+-          openCommandPalette({ open: "new-thread-in" });
+-          return;
+-        }
+-        void startNewThreadFromContext({
+-          activeDraftThread,
+-          activeThread: activeThread ?? undefined,
+-          defaultProjectRef,
+-          handleNewThread,
+-        });
++        startNewThread();
+         return;
+       }
+ 
+@@ -164,11 +210,10 @@ function ChatRouteGlobalShortcuts() {
+     keybindings,
+     defaultProjectRef,
+     previewOpen,
+-    projectGroupCount,
+     routeThreadRef,
+     selectedThreadKeysSize,
+-    legacySidebarEnabled,
+     terminalOpen,
++    startNewThread,
+   ]);
+ 
+   return null;
+diff --git a/apps/web/src/session-logic.test.ts b/apps/web/src/session-logic.test.ts
+index 401934bc..aa8ac8cb 100644
+--- a/apps/web/src/session-logic.test.ts
++++ b/apps/web/src/session-logic.test.ts
+@@ -61,6 +61,27 @@ function makeActivity(overrides: {
+   };
+ }
+ 
++it.each(["started", "completed", "failed", "skipped"] as const)(
++  "shows manual settle %s output in an otherwise empty thread",
++  (status) => {
++    const entries = deriveWorkLogEntries([
++      makeActivity({
++        kind: `settle-script.${status}`,
++        summary: `Manual settle action ${status}`,
++        tone: status === "failed" ? "error" : "info",
++        payload: { detail: "Cleanup command output" },
++      }),
++    ]);
++    expect(entries).toHaveLength(1);
++    expect(entries[0]).toMatchObject({
++      label: `Manual settle action ${status}`,
++      detail: "Cleanup command output",
++      tone: status === "failed" ? "error" : "info",
++    });
++    expect(deriveTimelineEntries([], [], entries)).toMatchObject([{ kind: "work" }]);
++  },
++);
++
+ describe("deriveActivePlanState", () => {
+   it("returns the latest plan update for the active turn", () => {
+     const activities: OrchestrationThreadActivity[] = [
+diff --git a/docs/user/project-settings.md b/docs/user/project-settings.md
+index c76c1854..ecf511f9 100644
+--- a/docs/user/project-settings.md
++++ b/docs/user/project-settings.md
+@@ -33,3 +33,19 @@ upstream.
+ T3 Code only pulls when it can fast-forward and the checkout has no changed files, untracked files,
+ or local commits. It skips checkouts on another branch or without an upstream. If a checkout has
+ local work, resolve it yourself before automatic pulls can resume.
++
++## Clean up resources when settling a worktree
++
++Select a project, edit an action, and enable **Run when manually settling a worktree**. Use this
++for a project command that stops its runtime and removes disposable data. Review the command
++before enabling it: it runs with your server account's permissions and may delete resources.
++Shared machine actions do not enable settlement cleanup; each project must opt in. Imported
++`t3.json` actions can opt in with `"runOnThreadSettle": true`.
++
++The action runs in the thread's worktree with `T3CODE_PROJECT_ROOT`, `T3CODE_WORKTREE_PATH`, and
++`T3CODE_THREAD_ID` available. It runs on a new manual settlement, never on automatic settlement
++or imported history. Local checkouts and worktrees shared with active threads are skipped.
++T3 Code keeps the Git worktree and records progress, output, skips, and failures in the thread.
++Each command has a two-minute timeout. While cleanup runs, other threads remain usable, and
++T3 Code prevents this checkout from being resumed or changed. A failed command leaves the thread
++settled; inspect its output before retrying the action yourself.
+diff --git a/packages/contracts/src/desktopAppActivation.ts b/packages/contracts/src/desktopAppActivation.ts
+index 6ae0f234..c7fdbe64 100644
+--- a/packages/contracts/src/desktopAppActivation.ts
++++ b/packages/contracts/src/desktopAppActivation.ts
+@@ -7,6 +7,27 @@ export const DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION = 1 as const;
+ export const DesktopAppActivationPlatform = Schema.Literals(["darwin", "linux", "win32"]);
+ export type DesktopAppActivationPlatform = typeof DesktopAppActivationPlatform.Type;
+ 
++export const MicroDialAction = Schema.Literals([
++  "dial-clockwise",
++  "dial-counterclockwise",
++  "dial-press",
++  "composer-toggle",
++]);
++export type MicroDialAction = typeof MicroDialAction.Type;
++
++export const MicroControlAction = Schema.Union([
++  MicroDialAction,
++  Schema.Literals([
++    "new-thread",
++    "new-project",
++    "latest-message",
++    "settle-thread",
++    "terminal-toggle",
++    "command-palette",
++  ]),
++]);
++export type MicroControlAction = typeof MicroControlAction.Type;
++
+ export const DesktopAppOpenWorkspaceRequest = Schema.Struct({
+   version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
+   requestId: TrimmedNonEmptyString,
+@@ -21,9 +42,18 @@ export const DesktopAppOpenThreadRequest = Schema.Struct({
+   environmentId: EnvironmentId,
+   threadId: ThreadId,
+ });
++export const DesktopAppMicroControlRequest = Schema.Struct({
++  version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
++  requestId: TrimmedNonEmptyString,
++  type: Schema.Literal("micro-control"),
++  action: MicroControlAction,
++});
++export type DesktopAppMicroControlRequest = typeof DesktopAppMicroControlRequest.Type;
++
+ export const DesktopAppActivationRequest = Schema.Union([
+   DesktopAppOpenWorkspaceRequest,
+   DesktopAppOpenThreadRequest,
++  DesktopAppMicroControlRequest,
+ ]);
+ export type DesktopAppActivationRequest = typeof DesktopAppActivationRequest.Type;
+ 
+@@ -34,12 +64,13 @@ export const DesktopAppActivationErrorCode = Schema.Literals([
+   "platform-mismatch",
+   "project-create-failed",
+   "thread-open-failed",
++  "micro-control-unavailable",
+   "request-timeout",
+   "internal-error",
+ ]);
+ export type DesktopAppActivationErrorCode = typeof DesktopAppActivationErrorCode.Type;
+ 
+-export const DesktopAppActivationSuccess = Schema.Struct({
++export const DesktopAppOpenSuccess = Schema.Struct({
+   version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
+   requestId: TrimmedNonEmptyString,
+   ok: Schema.Literal(true),
+@@ -47,6 +78,18 @@ export const DesktopAppActivationSuccess = Schema.Struct({
+   threadId: ThreadId,
+   environmentId: Schema.optional(EnvironmentId),
+ });
++export const DesktopAppMicroControlSuccess = Schema.Struct({
++  version: Schema.Literal(DESKTOP_APP_ACTIVATION_PROTOCOL_VERSION),
++  requestId: TrimmedNonEmptyString,
++  ok: Schema.Literal(true),
++  action: MicroControlAction,
++});
++export type DesktopAppMicroControlSuccess = typeof DesktopAppMicroControlSuccess.Type;
++
++export const DesktopAppActivationSuccess = Schema.Union([
++  DesktopAppOpenSuccess,
++  DesktopAppMicroControlSuccess,
++]);
+ export type DesktopAppActivationSuccess = typeof DesktopAppActivationSuccess.Type;
+ 
+ export const DesktopAppActivationFailure = Schema.Struct({
+diff --git a/packages/contracts/src/orchestration.ts b/packages/contracts/src/orchestration.ts
+index 37f5476f..724cf456 100644
+--- a/packages/contracts/src/orchestration.ts
++++ b/packages/contracts/src/orchestration.ts
+@@ -264,6 +264,8 @@ export const ProjectScript = Schema.Struct({
+   command: TrimmedNonEmptyString,
+   icon: ProjectScriptIcon,
+   runOnWorktreeCreate: Schema.Boolean,
++  /** Only explicit project actions run after a new manual worktree settlement. */
++  runOnThreadSettle: Schema.optional(Schema.Boolean),
+   /**
+    * URL to open in the in-app browser preview when this script runs (or
+    * when the user explicitly requests a preview). Optional; only honored on
+diff --git a/packages/contracts/src/t3ProjectFile.test.ts b/packages/contracts/src/t3ProjectFile.test.ts
+index ed19c6d6..1745a73d 100644
+--- a/packages/contracts/src/t3ProjectFile.test.ts
++++ b/packages/contracts/src/t3ProjectFile.test.ts
+@@ -28,6 +28,23 @@ describe("T3ProjectFile", () => {
+     expect(decoded.scripts?.[1]).toEqual({ name: "Test", command: "pnpm test" });
+   });
+ 
++  it("preserves explicit manual settle opt-in without opting in existing scripts", () => {
++    expect(
++      decode({
++        scripts: [
++          { name: "Cleanup", command: "cleanup", runOnThreadSettle: true },
++          { name: "Test", command: "test" },
++        ],
++      }).scripts,
++    ).toEqual([
++      { name: "Cleanup", command: "cleanup", runOnThreadSettle: true },
++      { name: "Test", command: "test" },
++    ]);
++    expect(() =>
++      decode({ scripts: [{ name: "Cleanup", command: "cleanup", runOnThreadSettle: "yes" }] }),
++    ).toThrow();
++  });
++
+   it("decodes an empty object and ignores unknown fields", () => {
+     expect(decode({})).toEqual({});
+     expect(decode({ futureField: true })).toEqual({});
+diff --git a/packages/contracts/src/t3ProjectFile.ts b/packages/contracts/src/t3ProjectFile.ts
+index 5062a1a3..b7ea7c29 100644
+--- a/packages/contracts/src/t3ProjectFile.ts
++++ b/packages/contracts/src/t3ProjectFile.ts
+@@ -42,6 +42,12 @@ export const T3ProjectFileScript = Schema.Struct({
+         "When true, the script runs automatically after a worktree is created for a new thread.",
+     }),
+   ),
++  runOnThreadSettle: Schema.optionalKey(
++    Schema.Boolean.annotate({
++      description:
++        "Run after a new manual settlement of a worktree thread. Never runs for automatic settlement, local checkouts, or shared active worktrees. The command may delete runtime resources and data; worktree files are preserved by T3 Code.",
++    }),
++  ),
+   previewUrl: Schema.optionalKey(
+     trimmedNonEmpty({
+       description:
+diff --git a/packages/shared/src/projectScripts.ts b/packages/shared/src/projectScripts.ts
+index 4d98e36b..103d4723 100644
+--- a/packages/shared/src/projectScripts.ts
++++ b/packages/shared/src/projectScripts.ts
+@@ -55,3 +55,14 @@ export function projectScriptRuntimeEnv(
+ export function setupProjectScript(scripts: readonly ProjectScript[]): ProjectScript | null {
+   return scripts.find((script) => script.runOnWorktreeCreate) ?? null;
+ }
++
++/** Destructive lifecycle actions require project opt-in; machine defaults never opt projects in. */
++export function settleProjectScripts(
++  settings: Pick<ServerSettings, "projectScriptOverrides">,
++  project: { id: ProjectId; scripts: readonly ProjectScript[] },
++): readonly ProjectScript[] {
++  const override = settings.projectScriptOverrides[project.id];
++  return (override === null ? [] : (override ?? project.scripts)).filter(
++    (script) => script.runOnThreadSettle === true,
++  );
++}

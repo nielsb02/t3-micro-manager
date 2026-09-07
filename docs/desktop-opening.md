@@ -113,8 +113,108 @@ a custom T3 home; leave it blank for the default installation.
 Selecting an app does not automatically select its custom data directory;
 configure this socket override if that app uses a different T3 home.
 
-This change adds desktop navigation. It does not add remote status aggregation
-to Micro Manager. Status still comes from the configured local environment.
+The optional dial and joystick controls use the same socket with a separate
+request. They require a build that implements `micro-control`; the original
+`open-thread` patch alone does not provide them.
+
+The companion [controls patch](../patches/t3code-micro-controls.patch) targets the
+maintained T3 fork at commit `179f7a2a`. Apply it to that checkout before running
+the desktop build above. It includes the renderer's focus-aware settings
+navigation, spare-button actions, project settle hooks, and the socket extension. Existing published builds may predate this
+patch; use the matching locally built T3 app when enabling the dial controls.
+
+In a new chat, the dial can choose the project, workspace, source branch, model,
+reasoning, and permissions. Disabled or unavailable settings are skipped. On
+narrow windows, model options and permissions are in the existing **More composer
+controls** menu. Turning highlights an option; pressing confirms it. Joystick
+down dismisses an open picker without applying its highlighted choice and returns
+to scrolling. Confirmed settings and the draft are retained.
+
+```json
+{"version":1,"requestId":"unique-id","type":"micro-control","action":"dial-clockwise"}
+```
+
+The fixed dial/joystick actions are `dial-clockwise`, `dial-counterclockwise`,
+`dial-press`, and `composer-toggle`. Spare physical buttons can be assigned
+`new-thread`, `new-project`, `composer-toggle`, `latest-message`, `settle-thread`,
+`terminal-toggle`, or `command-palette`. A successful response echoes the action
+and request ID:
+
+```json
+{"version":1,"requestId":"unique-id","ok":true,"action":"dial-clockwise"}
+```
+
+Micro Manager checks both fields and version 1. Rejections use the existing
+`ok: false`, `code`, and `message` format. Controls are sent in order, and stopping
+the bridge or saving a configuration discards queued inputs. Every request verifies
+the socket's owning process against the frontmost T3 application. When an app is
+selected in Configuration, it must match that installation too. Controls never
+start or activate a desktop app. The same checks apply to assigned button actions.
+
+Micro Manager stores button assignments in `actionButtons`, keyed by physical
+button number. For example, `{"actionButtons":{"6":"settle-thread","7":"new-thread"}}`
+assigns two spare buttons. Existing configurations default to an empty assignment
+map. Action buttons and session keys must be disjoint, and each assigned button
+uses its existing physical-number-plus-six AG slot. With dial/joystick controls
+enabled, their combined count must leave four slots free. Unassigned bindings,
+including microphone and Enter shortcuts, remain with Input. The configuration
+UI reviews these changes before Apply saves a backup and writes the mapping.
+
+The virtual pad includes dial rotation, a **Press** button, and joystick down.
+Its window stays nonactivating so clicking these controls can leave T3 frontmost.
+Enable and apply the optional controls on an emulator layer with a radial joystick
+before trying them. `scripts/verify-micro-controls.sh` checks mapping and event
+ordering without hardware or live settings; `scripts/verify-desktop.sh` checks
+every supported action over local sockets.
+
+## Project cleanup on settle
+
+T3 project actions have a **Run when manually settling a worktree** switch. It
+runs an explicitly configured project command on a new manual settlement, with
+`T3CODE_PROJECT_ROOT`, `T3CODE_WORKTREE_PATH`, and `T3CODE_THREAD_ID` available.
+Automatic settlement and imported history do not trigger it. Primary checkouts,
+active shared worktrees, and checkouts with another operation in progress are
+skipped with a visible explanation. Commands time out after two minutes.
+
+Cleanup runs in the background. Other threads remain usable; T3 prevents the
+same worktree from being resumed or changed until cleanup finishes. The thread
+shows started, completed, failed, or skipped status with expandable output. A
+failure leaves the thread settled so its result can be inspected.
+
+For GuestSpace, the companion [workspace patch](../patches/guestspace-workspace-settle.patch)
+targets the workspace control plane at `233fbac`. These changes are also applied
+locally in `/Users/niels/dev/guestspace/workspace`.
+
+1. Use the matching T3 preview and open **Project settings** for `workspace`.
+2. Under **Actions**, choose **Import scripts → Shut down workspace runtimes**.
+3. Confirm **Run when manually settling a worktree** is enabled. If the action
+   editor opens, choose **Save action**.
+4. Assign **Settle thread** to a spare button in Micro Manager and apply the controls.
+
+The imported command is:
+
+```sh
+"$T3CODE_PROJECT_ROOT/bin/guestspace" workspace shutdown "$T3CODE_WORKTREE_PATH" --json
+```
+
+It calls the primary control-plane CLI so older linked task workspaces can use
+the new command. GuestSpace verifies the registered composite workspace and
+its repository ownership before calling each repository's `runtime.shutdown`.
+For staff-portal this removes task containers, test databases, the MinIO bucket,
+and Redis data; guestspace-web stops its development server. Git worktrees and
+source files remain. Each repository's success or failure is included in the result.
+
+## Isolated controls verification
+
+On 2026-09-07, the focused dial and catalog checks passed in a real T3 web UI,
+including compact composer menus, scrolling, latest message, focus cancellation,
+draft preservation, new chat/project, terminal toggle, and manual settlement.
+Project action import and persistence, failed cleanup, successful GuestSpace CLI
+shutdown through harmless adapters, and removal of disposable runtime test data
+also passed. No provider prompts, live resource cleanup, or hardware mapping
+changes were performed. Physical dial/button testing remains a separate check.
+
+Status still comes from the configured local environment.
 
 ## Verified locally
 

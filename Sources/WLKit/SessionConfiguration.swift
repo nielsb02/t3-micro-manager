@@ -50,10 +50,13 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
         set { pinsByProvider[provider.rawValue] = newValue }
     }
     public var driveAmbient = false
+    public var microControlsEnabled = false
+    public var actionButtons: [Int: T3MicroAction] = [:]
+    public var assignedButtonKeys: [Int] { sessionKeys + actionButtons.keys.sorted() }
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case provider, t3, target, sessionKeys, selection, pinnedSessions, pinsByProvider, driveAmbient
+        case provider, t3, target, sessionKeys, selection, pinnedSessions, pinsByProvider, driveAmbient, microControlsEnabled, actionButtons
     }
 
     public init(from decoder: Decoder) throws {
@@ -64,6 +67,8 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
         sessionKeys = try values.decodeIfPresent([Int].self, forKey: .sessionKeys) ?? Pad.agentKeyIDs
         selection = try values.decodeIfPresent(SessionSelectionMode.self, forKey: .selection) ?? .mixed
         driveAmbient = try values.decodeIfPresent(Bool.self, forKey: .driveAmbient) ?? false
+        microControlsEnabled = try values.decodeIfPresent(Bool.self, forKey: .microControlsEnabled) ?? false
+        actionButtons = try values.decodeIfPresent([Int: T3MicroAction].self, forKey: .actionButtons) ?? [:]
         if let scoped = try values.decodeIfPresent([String: [Int: String]].self, forKey: .pinsByProvider) {
             pinsByProvider = scoped
         } else {
@@ -79,6 +84,8 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
         try values.encode(sessionKeys, forKey: .sessionKeys)
         try values.encode(selection, forKey: .selection)
         try values.encode(driveAmbient, forKey: .driveAmbient)
+        try values.encode(microControlsEnabled, forKey: .microControlsEnabled)
+        try values.encode(actionButtons, forKey: .actionButtons)
         try values.encode(pinsByProvider, forKey: .pinsByProvider)
         // Keep the active pins readable if the user rolls back to an earlier local build.
         try values.encode(pinnedSessions, forKey: .pinnedSessions)
@@ -118,6 +125,19 @@ public struct SessionConfiguration: Codable, Equatable, Sendable {
         guard !sessionKeys.isEmpty, Set(sessionKeys).count == sessionKeys.count,
               sessionKeys.allSatisfy({ (0...12).contains($0) }) else {
             throw ConfigurationError.invalid("Choose at least one distinct session key between 0 and 12.")
+        }
+        guard actionButtons.keys.allSatisfy({ (0...12).contains($0) }),
+              Set(actionButtons.keys).isDisjoint(with: Set(sessionKeys)),
+              actionButtons.values.allSatisfy(T3MicroAction.assignableActions.contains) else {
+            throw ConfigurationError.invalid("Assign T3 actions only to spare buttons between 0 and 12. A button can have either a session or an action.")
+        }
+        if microControlsEnabled || !actionButtons.isEmpty {
+            guard provider == .t3, t3.openTarget == .desktop else {
+                throw ConfigurationError.invalid("T3 actions, the dial, and joystick down require the T3 desktop connection.")
+            }
+        }
+        if microControlsEnabled && assignedButtonKeys.count > 10 {
+            throw ConfigurationError.invalid("Assign at most 10 session and action buttons in total to leave four agent slots for the dial and joystick down.")
         }
     }
 }

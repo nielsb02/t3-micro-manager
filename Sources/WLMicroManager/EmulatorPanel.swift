@@ -5,9 +5,8 @@ import WLKit
 /// A window showing the virtual pad: the lights the bridge is driving, and
 /// keys you can press back at it.
 ///
-/// It is a plain resizable window rather than one of the floating panels,
-/// because unlike the stack or land views this one is meant to be clicked, sat
-/// beside your editor, and left open.
+/// The panel leaves the current app active when its controls are clicked, so
+/// foreground-only controls can be exercised against the selected T3 desktop.
 @MainActor
 final class EmulatorWindowController: NSObject, NSWindowDelegate {
     static let shared = EmulatorWindowController()
@@ -21,24 +20,26 @@ final class EmulatorWindowController: NSObject, NSWindowDelegate {
                 window.contentView = NSHostingView(rootView: EmulatorView(emulator: emulator))
                 shownEmulator = emulator
             }
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            window.orderFrontRegardless()
             return
         }
 
-        let window = NSWindow(
+        let window = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 380, height: 560),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .resizable, .nonactivatingPanel],
             backing: .buffered,
             defer: false
         )
         window.title = "Creator Micro 2 — emulated"
         window.isReleasedWhenClosed = false
+        window.isFloatingPanel = true
+        window.level = .floating
+        window.becomesKeyOnlyIfNeeded = true
+        window.hidesOnDeactivate = false
         window.delegate = self
         window.center()
         window.contentView = NSHostingView(rootView: EmulatorView(emulator: emulator))
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        window.orderFrontRegardless()
         self.window = window
         shownEmulator = emulator
     }
@@ -100,6 +101,8 @@ struct EmulatorView: View {
 
             HStack(spacing: 10) {
                 stepper("Dial", down: Pad.dialDownID, up: Pad.dialUpID)
+                Button("Press") { emulator.press(Pad.dialPressID) }
+                    .help("Press the dial")
                 Spacer(minLength: 0)
                 joystick
             }
@@ -175,7 +178,7 @@ struct EmulatorView: View {
                 .background(RoundedRectangle(cornerRadius: 4).fill(Color.secondary.opacity(0.14)))
         }
         .buttonStyle(.plain)
-        .help("Joystick — key \(key)")
+        .help(key == Pad.joySouthID ? "Joystick down: toggle composer focus when configured" : "Joystick, key \(key)")
     }
 
     private func stepper(_ label: String, down: Int, up: Int) -> some View {
@@ -211,8 +214,8 @@ struct EmulatorView: View {
             HStack {
                 Label(
                     emulator.bound.isEmpty
-                        ? "No session keys on this layer"
-                        : "\(emulator.bound.count) session keys on this layer",
+                        ? "No controls assigned on this layer"
+                        : "\(emulator.bound.count) controls assigned on this layer",
                     systemImage: emulator.bound.isEmpty ? "keyboard" : "checkmark.circle"
                 )
                 .font(.caption)
