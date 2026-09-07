@@ -36,6 +36,10 @@ struct MicroManagerApp: App {
                 .task {
                     guard !initialized else { return }
                     initialized = true
+                    bridge.onShowCommands = { [weak bridge] in
+                        if let bridge { CmuxCommandWindowController.shared.show(bridge) }
+                    }
+                    bridge.onControlOverride = { CmuxCommandWindowController.shared.handle($0) }
                     // Choose the transport before starting: `useEmulator`
                     // rebuilds the device, so doing it after would tear down a
                     // connection we just made.

@@ -15,7 +15,10 @@ connection settings, never a device handle or a physical key mapping.
 | `BridgeController` | Polling, provider lifecycle, dispatch, layer checks and hardware lighting |
 | `LayerMapping` | Selective bindings, AG slots, backups and restoration |
 
-The bridge keeps one provider instance for its configured connection. Testing an
+The bridge keeps a provider instance for each visited layer configuration and polls
+the active layer. Physical layer changes select the corresponding provider and restore
+its assignments and completion acknowledgements. A provider/connection change
+invalidates that layer's cached instance. Testing an
 unsaved connection uses a separate instance, shared by Test and Open while the
 draft connection settings remain the same. A provider or connection change
 replaces the active instance; changing session selection or physical keys reuses
@@ -50,7 +53,7 @@ bridge owns polling.
 ```
 
 `ExampleClient` represents the new integration's own transport. The existing
-adapters are `T3SessionProvider`, `HerdrSessionProvider` and `DemoSessionProvider`.
+adapters are `T3SessionProvider`, `CmuxSessionProvider`, `HerdrSessionProvider` and `DemoSessionProvider`.
 Register a new built-in in `SessionProviderKind` and `SessionProviders.make`, add
 any Codable connection settings and its configuration fields, and update
 `SessionConfiguration.hasSameConnection` to compare those settings. Session
@@ -100,10 +103,12 @@ Inputs are sent only on an explicit caller request, never in response to status
 changes. No input is automatically submitted, approved or retried by the bridge.
 
 T3 does not implement this optional interface: its current pairing is read-only.
-The configuration dashboard does not bind text or custom actions yet. A future
-binding UI can use the advertised capabilities without changing the device
-transport. Wispr Flow and ordinary shortcuts remain configured in Work Louder
-Input.
+cmux also implements `SessionControlProvider` for current-pane navigation,
+workspace navigation, explicit input and named voice commands. Layer-specific
+`controlBindings` connect buttons, encoder events and joystick directions to
+those operations. `LayerMapping.slotAssignments` allocates controls alongside
+session keys within the shared 20-slot limit. Codex reservations reduce that to
+14. Text macros insert without Enter. Wispr Flow stays configured in Input.
 
 ## Verification
 
@@ -122,3 +127,64 @@ routing, AG slot isolation, selective lighting and mapping restoration.
 The original Herdr action panels and `StatusMapper` remain as upstream reference
 code. The active bridge uses the provider interface and `SessionAppearance`;
 legacy macro settings and colour defaults do not configure the active bridge.
+
+## Layer configurations and cmux
+
+`SessionConfiguration.layers` stores named provider/layer configurations. The
+selected layer exposes the existing provider, connection, key and pin properties.
+Legacy single-layer files migrate into one configuration without changing their
+Codex reservation. A physical device layer may occur only once; separate device
+layers may use the same firmware AG slots because the bridge checks the live
+layer before routing or painting.
+
+The global `reserveCodexSlots` setting chooses an offset of six or zero. Mapping
+records remain independent per hardware layer, including their actual owned
+codes, so changing the offset can restore old bindings before applying new ones.
+An attempted mapping is persisted alongside prior recovery ownership until
+readback verifies the write. Restore and retry can recover either state after
+an interruption without adopting the bridge's previous AG code as an original.
+Saved configuration changes do not silently remap keys. Each affected layer needs
+explicit Apply. An applied layer must be restored before moving or removing its
+configuration.
+
+cmux requires 0.64.22 and the required running-server capabilities. The client
+joins current `system.tree` UUIDs to active hook records and native notifications.
+The 0.64.22 Codex handlers do not populate `active_for_surface`. For unindexed
+Codex records, the client checks a live PID, resolves it through
+`agent.resolve_delivery_target`, and requires `surface.resume.get` to name the
+same Codex checkpoint. Only that verified current terminal receives the status;
+dead processes, replaced conversations and unproven bindings stay unknown.
+Its workspace view aggregates monitored agents. Its selected-workspace view
+returns terminal/browser surfaces, including unknown surfaces without agent
+hooks. Pins use separate namespaces for those views. `SessionInputProvider`
+accepts text insertion and explicit submit/escape/interrupt actions; these are
+also selectable as explicit hardware control bindings.
+
+Use `verify-layers.sh` and `verify-cmux.sh` alongside the existing provider and
+bridge checks. These use temporary configuration and fixtures, never live
+terminal input or physical remapping. Layer regressions cover continued polling
+after startup selects another layer, a first press during an old provider's
+pending refresh, and restoration or retry after an interrupted slot change.
+
+The `feed.list` response supplies typed parent Stop events and pending permissions,
+questions and plan requests, keyed by agent and session. It corrects stale running
+state in cmux 0.64.22's Codex prompt stack. Tool-result events, which also contain
+subagent exits and idle reminders, cannot end a parent response. The newest
+prompt/tool start supersedes an older Stop. A Claude Waiting notification matching
+the hook update and a completed parent response is idle, not blocked. Error and
+real pending approval states remain authoritative. Native unread notifications
+still determine green completion lights; reading them in cmux clears green.
+
+HID controls are serialized, checked against the actual hardware layer before
+dispatch, and canceled and drained when the bridge stops. A voice command panel
+keeps its layer identity and rejects submission after a layer change. Its Submit
+and Escape actions are intercepted while the panel is open, so one physical press
+cannot also reach a terminal. The optional controls remain disabled for saved
+configurations until selected and applied.
+
+`./scripts/verify-controls.sh` checks allocation, capacity, round-trip settings,
+dial/joystick restoration, queued emulator HID events and panel interception.
+`./scripts/verify-cmux.sh` covers native navigation and lifecycle reconciliation
+through a real CLI fixture process. Live read-only checks are available with
+`./scripts/verify-cmux.sh --live`. A full physical dial/joystick acceptance check
+still requires using the configured hardware layer.

@@ -15,7 +15,7 @@ final class ConfigurationWindowController: NSObject, NSWindowDelegate {
             return
         }
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 730, height: 750),
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 860),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
@@ -42,6 +42,7 @@ struct ConfigurationPanel: View {
     @State private var busy: String?
     @State private var feedback: String?
     @State private var feedbackIsError = false
+    @StateObject private var workspaceLoader = CmuxWorkspaceLoader()
 
     init(bridge: BridgeController) {
         self.bridge = bridge
@@ -53,38 +54,168 @@ struct ConfigurationPanel: View {
         VStack(spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 5) {
-                    Text("Your sessions, on your Micro").font(.title2).bold()
-                    Text("Choose a connection, layer, and session keys. Manage ordinary shortcuts in Work Louder Input.")
+                    Text("Your apps, one Micro").font(.title2).bold()
+                    Text("Give each app its own layer. Your keys and lights follow the active layer on your Micro.")
                         .font(.callout).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer()
-                Image(systemName: "keyboard").font(.system(size: 30)).foregroundStyle(.tint)
+                Image(systemName: "square.3.layers.3d").font(.system(size: 30)).foregroundStyle(.tint)
             }
             .padding(22)
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    connectionSection
-                    deviceSection
-                    assignmentSection
-                }
-                .padding(22)
+            codexSection
+                .padding(.horizontal, 22).padding(.bottom, 18)
                 .disabled(busy != nil || bridge.isBusy)
+            Divider()
+            HStack(spacing: 0) {
+                layerSidebar
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        layerHeading
+                        connectionSection
+                        assignmentSection
+                        deviceSection
+                        if draft.provider == .cmux {
+                            CmuxControlsEditor(bindings: $draft.controlBindings, sessionKeys: draft.sessionKeys, reserveCodexSlots: draft.reserveCodexSlots)
+                        }
+                    }
+                    .padding(22)
+                }
             }
+            .disabled(busy != nil || bridge.isBusy)
             Divider()
             footer
         }
-        .frame(minWidth: 650, minHeight: 600)
+        .frame(minWidth: 920, minHeight: 700)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onChange(of: draft.selectedLayerID) { _ in
+            testedSessions = nil
+            pairingCode = ""
+            feedback = nil
+        }
         .onChange(of: draft.provider) { provider in
             testedSessions = nil; feedback = nil
             if !SessionSelectionMode.available(for: provider).contains(draft.selection) { draft.selection = .recent }
         }
         .onChange(of: draft.t3) { _ in testedSessions = nil }
+        .onChange(of: draft.cmux) { _ in testedSessions = nil }
         .onChange(of: bridge.configuration) { configuration in
-            if draft == baseline { draft = configuration }
+            if !hasUnsavedChanges {
+                let editingLayerID = draft.selectedLayerID
+                draft = configuration
+                if configuration.layers.contains(where: { $0.id == editingLayerID }) {
+                    draft.selectedLayerID = editingLayerID
+                }
+            }
             baseline = configuration
+        }
+        .task(id: workspaceLoader.requestID(for: draft)) {
+            await workspaceLoader.load(draft, using: bridge)
+        }
+    }
+
+    private var codexSection: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 16) {
+                Image(systemName: "keyboard.badge.ellipsis").font(.title2).foregroundStyle(.secondary)
+                    .padding(.top, 2)
+                VStack(alignment: .leading, spacing: 6) {
+                    Toggle("Use Codex desktop buttons", isOn: $draft.reserveCodexSlots)
+                        .font(.headline).toggleStyle(.switch)
+                    Text(draft.reserveCodexSlots
+                         ? "Reserves the first six shared agent slots for the Codex app. Keep its buttons on a separate layer in Input."
+                         : "Agent slots are available to Micro Manager. Turn this on if you also use the Codex app's controller buttons.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if SessionConfiguration.codexInstalled {
+                        Text("Codex is installed on this Mac.").font(.caption2).foregroundStyle(.secondary)
+                    }
+                    if draft.reserveCodexSlots != baseline.reserveCodexSlots {
+                        Text("Apply each configured layer again after changing this setting.")
+                            .font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .padding(10)
+        }
+    }
+
+    private var layerSidebar: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("LAYERS").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                .padding(.horizontal, 14).padding(.top, 18).padding(.bottom, 10)
+            ScrollView {
+                VStack(spacing: 5) {
+                    ForEach(draft.layers) { layer in
+                        Button { draft.selectedLayerID = layer.id } label: {
+                            HStack(alignment: .top, spacing: 9) {
+                                Image(systemName: providerIcon(layer.provider)).frame(width: 16)
+                                    .padding(.top, 2)
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(layer.name.isEmpty ? layer.provider.title : layer.name)
+                                        .font(.callout).fontWeight(.medium).lineLimit(1)
+                                    Text(layer.provider.title).font(.caption).foregroundStyle(.secondary)
+                                    Text(targetTitle(layer.target)).font(.caption2).foregroundStyle(.secondary)
+                                        .lineLimit(2)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(10)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(draft.selectedLayerID == layer.id ? Color.accentColor.opacity(0.14) : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: 7))
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Configure \(layer.name), \(layer.provider.title), \(targetTitle(layer.target))")
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+            HStack {
+                Menu {
+                    ForEach(SessionProviderKind.allCases.filter { $0 != .demo }, id: \.self) { provider in
+                        Button("Add \(provider.title) layer") { draft.addLayer(provider: provider) }
+                    }
+                } label: {
+                    Label("Add layer", systemImage: "plus")
+                }
+                .menuStyle(.borderlessButton)
+                Spacer()
+                Button { draft.removeLayer(id: draft.selectedLayerID) } label: {
+                    Image(systemName: "minus")
+                }
+                .buttonStyle(.borderless)
+                .disabled(draft.layers.count < 2 || selectedMappingApplied)
+                .help(selectedMappingApplied ? "Restore this layer's buttons before removing it" : "Remove this layer configuration")
+                .accessibilityLabel("Remove layer configuration")
+            }
+            .padding(14)
+            Divider()
+            Text("cmux, T3 and Herdr can share agent slots across separate layers. Micro Manager follows your hardware layer switches.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(14)
+        }
+        .frame(width: 210)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
+    }
+
+    private var layerHeading: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                TextField("Layer name", text: $draft.selectedLayer.name)
+                    .textFieldStyle(.plain).font(.title2).bold()
+                    .accessibilityLabel("Layer configuration name")
+                if selectedMappingApplied {
+                    Label("Applied", systemImage: "checkmark.circle.fill")
+                        .font(.caption).foregroundStyle(.green)
+                }
+            }
+            Text("Choose what this layer controls, then assign its keys.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -161,6 +292,8 @@ struct ConfigurationPanel: View {
                             }
                         }
                     }
+                } else if draft.provider == .cmux {
+                    cmuxConnectionFields
                 } else if draft.provider == .herdr {
                     Text("Connects to Herdr through its local control socket. Start Herdr before testing.")
                         .font(.callout).foregroundStyle(.secondary)
@@ -207,6 +340,41 @@ struct ConfigurationPanel: View {
         }
     }
 
+    private var cmuxConnectionFields: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("cmux 0.64.22 or newer required", systemImage: "checkmark.shield")
+                .font(.callout).fontWeight(.medium)
+            Text("In cmux Settings → Automation, set Socket Control Mode to Automation mode so Micro Manager can connect. Older cmux versions must be updated.")
+                .font(.caption).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            DisclosureGroup("Agent status setup") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Enable Claude Code Integration and Codex Integration in cmux Settings, then start new agent sessions. For a custom Codex launcher that bypasses cmux’s wrapper, run this once in a cmux terminal:")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("cmux hooks setup --agent codex")
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                    Text("The Codex CLI integration reports terminal status. The Codex desktop buttons setting above reserves slots for the separate desktop app.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 8)
+            }
+            DisclosureGroup("Advanced connection settings") {
+                VStack(spacing: 8) {
+                    labeledField("cmux executable") {
+                        TextField("/Applications/cmux.app/Contents/Resources/bin/cmux", text: $draft.cmux.cliPath)
+                    }
+                    labeledField("Socket path") {
+                        TextField("Use the default cmux socket", text: $draft.cmux.socketPath)
+                    }
+                }
+                .padding(.top, 8)
+            }
+        }
+    }
+
     private var deviceSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 14) {
@@ -227,18 +395,26 @@ struct ConfigurationPanel: View {
                         }
                     }
                 }
-                Text("Session keys use separate agent slots from Codex. If you applied the first build, save and apply once more to update those bindings.")
-                    .font(.caption).foregroundStyle(.secondary)
                 if bridge.availableLayers.isEmpty {
                     Text("Connect your Micro and read its layers, or enable the virtual pad from the menu.")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
-                    Picker("Layer", selection: selectedLayerID) {
+                    Picker("Micro layer", selection: selectedDeviceLayerID) {
                         Text("Select a layer…").tag("")
                         ForEach(bridge.availableLayers) { layer in
                             Text(layer.title).tag(layer.id)
+                                .disabled(targetIsUsedByAnotherLayer(layer.target))
                         }
                     }
+                    .disabled(selectedMappingApplied)
+                    if selectedMappingApplied {
+                        Text("Restore buttons below before moving this configuration to another Micro layer.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                if let target = draft.target, targetIsUsedByAnotherLayer(target) {
+                    Label("This Micro layer is assigned to another provider. Choose a different layer.", systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.red)
                 }
                 HStack(alignment: .center, spacing: 24) {
                     SessionKeyGrid(
@@ -252,7 +428,7 @@ struct ConfigurationPanel: View {
                         Text("Click the keys to use for sessions.").font(.callout).bold()
                         Text("\(draft.sessionKeys.count) selected")
                             .font(.caption).foregroundStyle(.tint)
-                        Text("Keep Wispr Flow on an unselected key. Configure the dial, joystick, and other shortcuts in Input.")
+                        Text("Keep Wispr Flow on an unselected key. Configure cmux navigation and spare buttons in the controls section below.")
                             .font(.caption).foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                         Text("The wide bottom key has two positions, 10 and 11. Both are left free by default.")
@@ -275,7 +451,8 @@ struct ConfigurationPanel: View {
                                         .foregroundStyle(.secondary).lineLimit(1)
                                     Spacer()
                                     Image(systemName: "arrow.right").foregroundStyle(.secondary)
-                                    Text("Session control")
+                                    Text(LayerMapping.agentCode(forPhysicalKey: key, slotOffset: draft.slotOffset) ?? "Unavailable")
+                                        .font(.system(.caption, design: .monospaced))
                                 }
                                 .font(.caption)
                             }
@@ -285,10 +462,15 @@ struct ConfigurationPanel: View {
                 }
                 Toggle("Use the ambient light for overall session status", isOn: $draft.driveAmbient)
                     .toggleStyle(.checkbox)
-                Text("The bridge is active only on the selected layer. Apply saves a backup before changing selected buttons.")
+                Text("Apply backs up this layer before changing its selected keys and configured controls. Other configured layers keep their own provider and assignments.")
                     .font(.caption).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                if let backup = bridge.backupPath {
+                ForEach(bridge.slotConflicts, id: \.self) { conflict in
+                    Label(conflict, systemImage: "exclamationmark.triangle")
+                        .font(.caption).foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let target = draft.target, let backup = bridge.backupPath(for: target) {
                     HStack {
                         Label("Mapping backup available", systemImage: "externaldrive.badge.checkmark")
                             .font(.caption).foregroundStyle(.secondary)
@@ -303,13 +485,28 @@ struct ConfigurationPanel: View {
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
         } label: {
-            Label("Layer & keys", systemImage: "keyboard").font(.headline)
+            Label("Micro layer & keys", systemImage: "keyboard").font(.headline)
         }
     }
 
     private var assignmentSection: some View {
         GroupBox {
             VStack(alignment: .leading, spacing: 12) {
+                if draft.provider == .cmux {
+                    CmuxViewSelector(
+                        scope: draft.cmux.scope,
+                        workspaceID: draft.cmux.workspaceID,
+                        workspaces: workspaceLoader.workspaces,
+                        isLoading: workspaceLoader.isLoading,
+                        error: workspaceLoader.error,
+                        onSelect: { scope, workspaceID in
+                            draft.cmux.scope = scope
+                            draft.cmux.workspaceID = workspaceID
+                        },
+                        onRefresh: { workspaceLoader.refresh() }
+                    )
+                    Divider()
+                }
                 Picker("Fill selected keys with", selection: $draft.selection) {
                     ForEach(SessionSelectionMode.available(for: draft.provider), id: \.self) { mode in
                         Text(mode.title(for: draft.provider)).tag(mode)
@@ -331,8 +528,12 @@ struct ConfigurationPanel: View {
                         }
                     }
                     if sessionChoices.isEmpty {
-                        Text("Test the connection to choose sessions to pin.")
-                            .font(.caption).foregroundStyle(.secondary)
+                        HStack {
+                            Text("Load this view's sessions to choose pins.")
+                                .font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Load sessions") { testConnection() }
+                        }
                     }
                 }
             }
@@ -356,12 +557,12 @@ struct ConfigurationPanel: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Text(draft == baseline ? "Settings saved" : "Unsaved settings")
+                Text(hasUnsavedChanges ? "Unsaved settings" : "Settings saved")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Save settings") { saveSettings(apply: false) }
                     .disabled(busy != nil || bridge.isBusy || draft.sessionKeys.isEmpty)
-                Button("Save & apply selected keys") { saveSettings(apply: true) }
+                Button("Save & apply this layer") { saveSettings(apply: true) }
                     .buttonStyle(.borderedProminent)
                     .disabled(busy != nil || bridge.isBusy || draft.target == nil || draft.sessionKeys.isEmpty)
             }
@@ -373,7 +574,37 @@ struct ConfigurationPanel: View {
         bridge.availableLayers.first { $0.target == draft.target }
     }
 
-    private var selectedLayerID: Binding<String> {
+    private var hasUnsavedChanges: Bool {
+        var settings = draft
+        settings.selectedLayerID = baseline.selectedLayerID
+        return settings != baseline
+    }
+
+    private var selectedMappingApplied: Bool {
+        guard let target = draft.target else { return false }
+        return bridge.hasAppliedMapping(for: target)
+    }
+
+    private func targetTitle(_ target: LayerTarget?) -> String {
+        guard let target else { return "Choose a Micro layer" }
+        return bridge.availableLayers.first(where: { $0.target == target })?.title
+            ?? "Profile \(target.profileID), layer \(target.layerID)"
+    }
+
+    private func targetIsUsedByAnotherLayer(_ target: LayerTarget) -> Bool {
+        draft.layers.contains { $0.id != draft.selectedLayerID && $0.target == target }
+    }
+
+    private func providerIcon(_ provider: SessionProviderKind) -> String {
+        switch provider {
+        case .t3: return "bubble.left.and.bubble.right"
+        case .cmux: return "terminal"
+        case .herdr: return "square.stack.3d.up"
+        case .demo: return "play.rectangle"
+        }
+    }
+
+    private var selectedDeviceLayerID: Binding<String> {
         Binding(
             get: { selectedLayer?.id ?? "" },
             set: { id in draft.target = bridge.availableLayers.first { $0.id == id }?.target }
@@ -409,6 +640,7 @@ struct ConfigurationPanel: View {
             draft.sessionKeys.removeAll { $0 == key }
             draft.pinnedSessions[key] = nil
         } else {
+            draft.controlBindings.removeAll { $0.inputID == key }
             draft.sessionKeys.append(key)
             let order = Pad.displayRows.flatMap { $0 }
             draft.sessionKeys.sort { (order.firstIndex(of: $0) ?? 99) < (order.firstIndex(of: $1) ?? 99) }
@@ -474,17 +706,18 @@ struct ConfigurationPanel: View {
             try checkBridgeError()
             baseline = bridge.configuration
             if apply {
-                await bridge.applyMapping()
+                await bridge.applyMapping(for: settings.selectedLayerID)
                 try checkBridgeError()
-                return "Selected keys applied. Enable Micro Manager and switch to your chosen layer."
+                return "Layer applied. Enable Micro Manager and switch to this layer on your Micro."
             }
             return "Settings saved. Device bindings are changed with Apply."
         }
     }
 
     private func restoreMapping() {
+        guard let target = draft.target else { return }
         run("Restoring button bindings…") {
-            await bridge.restoreMapping()
+            await bridge.restoreMapping(for: target)
             try checkBridgeError()
             return "Original button bindings restored."
         }

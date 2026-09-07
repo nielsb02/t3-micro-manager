@@ -73,6 +73,7 @@ import Foundation
         precondition(restored == cfg)
         print("App ordering, live rearrangement, excluded history and configuration round-trip passed.")
 
+        try SessionConfiguration(reserveCodexSlots: true).save()
         let bridge = BridgeController()
         await bridge.startDemo()
         precondition(bridge.lastError == nil, bridge.lastError ?? "")

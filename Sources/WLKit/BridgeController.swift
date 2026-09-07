@@ -22,7 +22,7 @@ public final class BridgeController: ObservableObject {
     @Published public private(set) var contendingClient = false
     @Published public private(set) var layerActive = false
     @Published public private(set) var emulator: PadEmulator?
-    @Published public private(set) var backupPath: String?
+    public var backupPath: String? { mappingRecord?.fullExportPath }
     @Published public private(set) var isBusy = false
 
     public var brightness: Double
@@ -33,6 +33,7 @@ public final class BridgeController: ObservableObject {
     private var deviceKeymap: [String: Any] = [:]
     private var pollTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var refreshedGeneration: Int?
     private var stopTask: Task<Void, Never>?
     private var generation = 0
     private var issuedIDs = Set<Int>()
@@ -44,8 +45,29 @@ public final class BridgeController: ObservableObject {
         var deviceIdentity: String
         var backup: LayerMapping.Backup
         var fullExportPath: String
+        // Non-nil while an attempted write still needs verification. Earlier
+        // ownership remains recoverable if the device kept some or all of it.
+        var previousBackups: [LayerMapping.Backup]?
+
+        var recoveryBackups: [LayerMapping.Backup] { [backup] + (previousBackups ?? []) }
     }
-    private var mappingRecord: MappingRecord?
+    private struct MappingArchive: Codable { var records: [MappingRecord] }
+    private var mappingRecords: [MappingRecord] = []
+    private var mappingRecord: MappingRecord? {
+        get { configuration.target.flatMap { mappingRecord(for: $0) } }
+        set {
+            mappingRecords.removeAll { $0.backup.target == configuration.target }
+            if let newValue { mappingRecords.append(newValue) }
+        }
+    }
+    private struct LayerRuntime {
+        var settings: SessionConfiguration
+        var provider: any SessionProvider
+        var sessions: [AgentSession]
+        var assignments: [Int: String]
+        var acknowledgements: SessionAcknowledgements
+    }
+    private var layerRuntimes: [String: LayerRuntime] = [:]
     private var recordURL: URL {
         SessionConfiguration.fileURL.deletingLastPathComponent()
             .appendingPathComponent(emulator == nil ? "mapping-backup.json" : "emulator-mapping-backup.json")
@@ -69,6 +91,12 @@ public final class BridgeController: ObservableObject {
         wire()
     }
 
+    @Published public private(set) var dialControlsWorkspaces = false
+    public var onShowCommands: (() -> Void)?
+    public var onControlOverride: ((SessionControlAction) -> Bool)?
+    private var inputTask: Task<Void, Never>?
+    private var inputTasks: [UUID: Task<Void, Never>] = [:]
+
     private func wire() {
         device.onDisconnect = { [weak self] _ in
             guard let self else { return }
@@ -86,24 +114,39 @@ public final class BridgeController: ObservableObject {
         device.onNotification = { [weak self] method, params in
             guard let self, method == OAI.notifyHID,
                   let value = params as? [String: Any], (value["act"] as? Int) == 1,
-                  let slot = OAI.agIndex(value["k"] as? String),
-                  let key = LayerMapping.physicalKey(forAgentSlot: slot) else { return }
-            Task {
+                  let slot = OAI.agIndex(value["k"] as? String) else { return }
+            guard self.inputTasks.count < 64 else { return }
+            let inputID = UUID()
+            let previous = self.inputTask
+            let queuedGeneration = self.generation
+            self.inputTask = Task { [weak self] in
+                await previous?.value
+                guard let self else { return }
+                defer { self.inputTasks[inputID] = nil }
+                guard !Task.isCancelled, self.generation == queuedGeneration,
+                      self.isRunning, !self.isBusy else { return }
+                await self.followActiveLayer()
                 let epoch = self.generation
-                // A layer may change between polls; never dispatch from cached state.
+                if self.sessions.isEmpty { await self.refresh() }
                 guard self.isRunning, !self.isBusy, await self.checkLayer(), self.keymapReady,
-                      self.isRunning, !self.isBusy, self.generation == epoch else { return }
-                self.handleKeyPress(key)
+                      self.generation == epoch, !Task.isCancelled else { return }
+                let slots = try? LayerMapping.slotAssignments(keys: self.configuration.sessionKeys,
+                    controls: self.configuration.activeControlBindings.map(\.inputID), slotOffset: self.configuration.slotOffset)
+                if let binding = self.configuration.activeControlBindings.first(where: { slots?[$0.inputID] == slot }) {
+                    do { try await self.performControl(binding.action, text: binding.text) }
+                    catch { if self.generation == epoch { self.lastError = error.localizedDescription } }
+                } else if let key = LayerMapping.physicalKey(forAgentSlot: slot, slotOffset: self.configuration.slotOffset),
+                          let id = self.assignments[key], let session = self.sessions.first(where: { $0.id == id }) {
+                    await self.focusSession(session)
+                }
             }
+            self.inputTasks[inputID] = self.inputTask
         }
     }
 
     public func start() async {
         guard !isRunning, !isBusy, stopTask == nil else { return }
         isRunning = true; generation += 1
-        let epoch = generation
-        await refresh()
-        guard isRunning, generation == epoch else { return }
         pollTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -111,16 +154,21 @@ public final class BridgeController: ObservableObject {
                 await self.refresh()
             }
         }
+        await refresh()
     }
 
     public func stop() async {
         if let stopTask { await stopTask.value; return }
         isRunning = false; generation += 1
+        let pendingInputs = Array(inputTasks.values)
+        for task in pendingInputs { task.cancel() }
+        inputTask = nil
         pollTask?.cancel(); pollTask = nil
         let pendingRefresh = refreshTask
         pendingRefresh?.cancel()
         let task = Task {
             await pendingRefresh?.value
+            for task in pendingInputs { await task.value }
             await clearOwnedLights()
             previousPicture = nil
             stopTask = nil
@@ -139,7 +187,7 @@ public final class BridgeController: ObservableObject {
         let pad = on ? PadEmulator() : nil
         emulator = pad; device = WLDevice(emulator: pad)
         deviceConnected = false; availableLayers = []; deviceKeymap = [:]
-        mappingRecord = nil; backupPath = nil; contendingClient = false
+        mappingRecords = []; contendingClient = false
         lastExternalTraffic = nil; issuedIDs = []
         wire()
         isBusy = false
@@ -164,22 +212,31 @@ public final class BridgeController: ObservableObject {
     private func readMapping() async throws {
         deviceKeymap = try await KeymapManager.read(device)
         availableLayers = try LayerMapping.layers(in: deviceKeymap)
-        if let data = try? Data(contentsOf: recordURL),
-           let record = try? JSONDecoder().decode(MappingRecord.self, from: data),
-           record.deviceIdentity == deviceIdentity {
-            mappingRecord = record; backupPath = record.fullExportPath
-        } else { mappingRecord = nil; backupPath = nil }
+        if let data = try? Data(contentsOf: recordURL) {
+            let decoder = JSONDecoder()
+            if let archive = try? decoder.decode(MappingArchive.self, from: data) {
+                mappingRecords = archive.records.filter { $0.deviceIdentity == deviceIdentity }
+            } else if let record = try? decoder.decode(MappingRecord.self, from: data), record.deviceIdentity == deviceIdentity {
+                mappingRecords = [record]
+            } else {
+                throw ConfigurationError.invalid("Could not read the mapping recovery file. Keep its backup before applying bindings.")
+            }
+        } else { mappingRecords = [] }
         updateMappingReadiness()
     }
 
     private func updateMappingReadiness() {
         guard let target = configuration.target else { keymapReady = false; return }
+        let slots = try? LayerMapping.slotAssignments(keys: configuration.sessionKeys,
+            controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
         keymapReady = mappingRecord?.backup.target == target
-            && configuration.sessionKeys.allSatisfy {
-                mappingRecord?.backup.originals[$0] != nil
-                    && mappingRecord?.backup.ownedCode(for: $0) == LayerMapping.agentCode(forPhysicalKey: $0)
+            && mappingRecord?.previousBackups == nil && slots != nil
+            && slots!.allSatisfy { input, slot in
+                mappingRecord?.backup.originals[input] != nil
+                    && mappingRecord?.backup.ownedCode(for: input) == String(format: "KV_OAI_AG%02d", slot)
             }
-            && LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys)
+            && LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys,
+                controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
     }
 
     public func inspectDevice() async {
@@ -203,17 +260,96 @@ public final class BridgeController: ObservableObject {
         } catch { layerActive = false; previousPicture = nil; return false }
     }
 
+    private func cacheCurrentLayer() {
+        layerRuntimes[configuration.selectedLayerID] = LayerRuntime(
+            settings: configuration, provider: provider, sessions: sessions,
+            assignments: assignments, acknowledgements: acknowledgements)
+    }
+
+    private func activateLayer(_ id: String) {
+        guard id != configuration.selectedLayerID else { return }
+        cacheCurrentLayer()
+        configuration.selectedLayerID = id
+        dialControlsWorkspaces = false
+        generation += 1
+        if let cached = layerRuntimes[id], cached.settings.hasSameConnection(as: configuration) {
+            provider = cached.provider; sessions = cached.sessions
+            assignments = cached.assignments; acknowledgements = cached.acknowledgements
+        } else {
+            provider = providerFactory(configuration)
+            sessions = []; assignments = [:]; acknowledgements = SessionAcknowledgements()
+        }
+        lastError = nil; previousPicture = nil
+        updateMappingReadiness(); renderPreview()
+    }
+
+    private func followActiveLayer() async {
+        guard device.isConnected, isRunning, !isBusy else { return }
+        let epoch = generation
+        guard let status = try? await device.callAsync("device.status") as? [String: Any],
+              isRunning, !isBusy, generation == epoch else { return }
+        if let layer = configuration.layers.first(where: { layer in
+            layer.target.map { LayerMapping.isActive(status: status, config: deviceKeymap, target: $0) } ?? false
+        }) { activateLayer(layer.id) }
+    }
+
+    private func mappingRecord(for target: LayerTarget) -> MappingRecord? {
+        mappingRecords.first { $0.backup.target == target }
+    }
+    public func hasAppliedMapping(for target: LayerTarget) -> Bool { mappingRecord(for: target) != nil }
+    public func backupPath(for target: LayerTarget) -> String? { mappingRecord(for: target)?.fullExportPath }
+    public var slotConflicts: [String] {
+        let managedTargets = Set(configuration.layers.compactMap(\.target))
+        let managedSlots = Set(configuration.layers.flatMap { layer in
+            (try? LayerMapping.slotAssignments(keys: layer.sessionKeys,
+                controls: layer.provider == .cmux ? layer.controlBindings.map(\.inputID) : [], slotOffset: configuration.slotOffset)).map { Array($0.values) } ?? []
+        })
+        return availableLayers.filter { !managedTargets.contains($0.target) }.compactMap { layer in
+            let slots = LayerMapping.agentSlots(config: deviceKeymap, target: layer.target).intersection(managedSlots)
+            guard !slots.isEmpty else { return nil }
+            let names = slots.sorted().map { String(format: "AG%02d", $0) }.joined(separator: ", ")
+            return "\(layer.title) also uses \(names). Its controller must respect the active layer."
+        }
+    }
+
     public func saveConfiguration(_ next: SessionConfiguration) async {
         guard !isBusy else { return }
-        do { try next.validate() } catch { lastError = error.localizedDescription; return }
+        do {
+            try next.validate()
+            for record in mappingRecords where configuration.layers.contains(where: { $0.target == record.backup.target }) {
+                guard next.layers.contains(where: { $0.target == record.backup.target }) else {
+                    throw ConfigurationError.invalid("Restore the applied layer's buttons before removing it or choosing another device layer.")
+                }
+            }
+        } catch { lastError = error.localizedDescription; return }
         isBusy = true
         let resume = isRunning
         await stop()
         do {
             try next.save()
-            if !configuration.hasSameConnection(as: next) {
-                provider = providerFactory(next)
-                acknowledgements = SessionAcknowledgements()
+            cacheCurrentLayer()
+            if configuration.selectedLayerID != next.selectedLayerID {
+                if let cached = layerRuntimes[next.selectedLayerID], cached.settings.hasSameConnection(as: next) {
+                    provider = cached.provider; acknowledgements = cached.acknowledgements
+                } else {
+                    provider = providerFactory(next); acknowledgements = SessionAcknowledgements()
+                }
+            } else if !configuration.hasSameConnection(as: next) {
+                provider = providerFactory(next); acknowledgements = SessionAcknowledgements()
+            }
+            layerRuntimes = layerRuntimes.reduce(into: [:]) { runtimes, entry in
+                let (id, previous) = entry
+                guard next.layers.contains(where: { $0.id == id }) else { return }
+                var settings = next; settings.selectedLayerID = id
+                guard previous.settings.hasSameConnection(as: settings) else { return }
+                var cached = previous
+                if previous.settings.selection != settings.selection
+                    || previous.settings.pinnedSessions != settings.pinnedSessions
+                    || previous.settings.sessionKeys != settings.sessionKeys {
+                    cached.sessions = []; cached.assignments = [:]
+                }
+                cached.settings = settings
+                runtimes[id] = cached
             }
             configuration = next
             assignments = [:]; sessions = []; keyColors = [:]; keyEffects = [:]
@@ -228,11 +364,16 @@ public final class BridgeController: ObservableObject {
         if resume { await start() }
     }
 
-    public func applyMapping() async {
+    public func applyMapping(for layerID: String? = nil) async {
         guard !isBusy else { return }
+        let id = layerID ?? configuration.selectedLayerID
+        guard configuration.layers.contains(where: { $0.id == id }) else {
+            lastError = "This layer configuration is no longer available."; return
+        }
         isBusy = true
         let resume = isRunning
         await stop()
+        activateLayer(id)
         do {
             try configuration.validate()
             guard let target = configuration.target else { throw ConfigurationError.invalid("Choose a layer first.") }
@@ -240,53 +381,68 @@ public final class BridgeController: ObservableObject {
             var base = deviceKeymap
             // Restore our prior selected bindings before moving or resizing the mapping.
             if let record = mappingRecord {
-                guard record.backup.target == target else {
-                    throw ConfigurationError.invalid("Restore the current mapping before applying to another layer. Your original bindings will be kept.")
-                }
-                base = try LayerMapping.restoring(config: base, backup: record.backup)
+                base = try LayerMapping.restoring(config: base, backups: record.recoveryBackups)
             }
-            var backup = try LayerMapping.capture(config: base, target: target, keys: configuration.sessionKeys)
-            if let previous = mappingRecord {
-                for (key, original) in previous.backup.originals where backup.originals[key] == nil {
-                    backup.originals[key] = original
-                    backup.ownedCodes?[key] = previous.backup.ownedCode(for: key)
-                }
-            }
-            let next = try LayerMapping.applying(config: base, target: target, keys: configuration.sessionKeys)
+            let backup = try LayerMapping.capture(config: base, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
+            let next = try LayerMapping.applying(config: base, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset)
             let directory = SessionConfiguration.fileURL.deletingLastPathComponent().appendingPathComponent("backups")
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let export = directory.appendingPathComponent("keymap-\(UUID().uuidString).json")
             try JSONSerialization.data(withJSONObject: deviceKeymap, options: [.prettyPrinted, .sortedKeys]).write(to: export, options: .atomic)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: export.path)
-            let record = MappingRecord(deviceIdentity: deviceIdentity, backup: backup, fullExportPath: export.path)
+            let previousBackups = (mappingRecord?.recoveryBackups ?? []).reduce(into: [LayerMapping.Backup]()) { result, previous in
+                if !result.contains(previous) { result.append(previous) }
+            }
+            var record = MappingRecord(deviceIdentity: deviceIdentity, backup: backup, fullExportPath: export.path,
+                                       previousBackups: previousBackups)
             // Persist recovery information before the flash write.
-            try JSONEncoder().encode(record).write(to: recordURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recordURL.path)
-            mappingRecord = record; backupPath = export.path
+            mappingRecord = record
+            try persistMappingRecords()
             try await writeMapping(next)
-            guard LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys) else {
+            guard NSDictionary(dictionary: next).isEqual(to: deviceKeymap),
+                  LayerMapping.isApplied(config: deviceKeymap, target: target, keys: configuration.sessionKeys, controls: configuration.activeControlBindings.map(\.inputID), slotOffset: configuration.slotOffset) else {
                 throw ConfigurationError.invalid("The device did not retain the selected bindings. The backup is available for restoration.")
             }
+            record.previousBackups = nil
+            mappingRecord = record
+            try persistMappingRecords()
+            updateMappingReadiness()
             lastError = nil
         } catch { lastError = error.localizedDescription }
         isBusy = false
         if resume && lastError == nil { await start() }
     }
 
+    private func persistMappingRecords() throws {
+        if mappingRecords.isEmpty {
+            if FileManager.default.fileExists(atPath: recordURL.path) { try FileManager.default.removeItem(at: recordURL) }
+        } else {
+            try JSONEncoder().encode(MappingArchive(records: mappingRecords)).write(to: recordURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: recordURL.path)
+        }
+    }
+
     public func restoreMapping() async {
+        guard let target = configuration.target else { return }
+        await restoreMapping(for: target)
+    }
+    public func restoreMapping(for target: LayerTarget) async {
         guard !isBusy else { return }
         isBusy = true; defer { isBusy = false }
         await stop()
         do {
             try await connect(); try await readMapping()
-            guard let record = mappingRecord else { throw ConfigurationError.invalid("No mapping backup for this device.") }
-            let restored = try LayerMapping.restoring(config: deviceKeymap, backup: record.backup)
+            guard let record = mappingRecord(for: target) else {
+                throw ConfigurationError.invalid("No mapping backup for this layer.")
+            }
+            let restored = try LayerMapping.restoring(config: deviceKeymap, backups: record.recoveryBackups)
             try await writeMapping(restored)
             guard NSDictionary(dictionary: restored).isEqual(to: deviceKeymap) else {
                 throw ConfigurationError.invalid("Restore verification failed. Keep the saved backup.")
             }
-            try FileManager.default.removeItem(at: recordURL)
-            mappingRecord = nil; backupPath = nil; updateMappingReadiness(); lastError = nil
+            mappingRecords.removeAll { $0.backup.target == target }
+            try persistMappingRecords()
+            updateMappingReadiness(); lastError = nil
         } catch { lastError = error.localizedDescription }
     }
 
@@ -322,7 +478,11 @@ public final class BridgeController: ObservableObject {
 
     private func refresh() async {
         guard isRunning, !isBusy else { return }
-        if let refreshTask { await refreshTask.value; return }
+        while let refreshTask {
+            await refreshTask.value
+            guard isRunning, !isBusy, !Task.isCancelled else { return }
+            if refreshedGeneration == generation { return }
+        }
         let task = Task {
             defer { refreshTask = nil }
             await performRefresh()
@@ -332,6 +492,12 @@ public final class BridgeController: ObservableObject {
     }
 
     private func performRefresh() async {
+        do {
+            try await connect()
+            try await readMapping()
+            await followActiveLayer()
+        } catch { }
+        guard isRunning, !isBusy, !Task.isCancelled else { return }
         let epoch = generation
         let activeProvider = provider
         var failure: String?
@@ -350,6 +516,7 @@ public final class BridgeController: ObservableObject {
             failure = error.localizedDescription
             sessions = sessions.map { var stale = $0; stale.status = .unknown; return stale }
         }
+        refreshedGeneration = epoch
         renderPreview()
         do {
             if activeProvider.requiresEmulator && emulator == nil {
@@ -386,7 +553,7 @@ public final class BridgeController: ObservableObject {
     private func paint() async throws {
         let threads = picture.map { physical -> OAI.Thread in
             var wire = physical
-            wire.id = LayerMapping.agentSlot(forPhysicalKey: physical.id)!
+            wire.id = LayerMapping.agentSlot(forPhysicalKey: physical.id, slotOffset: configuration.slotOffset)!
             return wire
         }
         let fingerprint = threads.map { "\($0.id):\($0.color ?? 0):\($0.effect?.rawValue ?? 0):\($0.speed ?? 0):\($0.brightness ?? 0)" }.joined(separator: "|") + (aggregateState?.rawValue ?? "")
@@ -401,7 +568,7 @@ public final class BridgeController: ObservableObject {
     }
     private func clearOwnedLights() async {
         guard device.isConnected, await checkLayer(), keymapReady else { return }
-        let threads = configuration.sessionKeys.compactMap { LayerMapping.agentSlot(forPhysicalKey: $0) }
+        let threads = configuration.sessionKeys.compactMap { LayerMapping.agentSlot(forPhysicalKey: $0, slotOffset: configuration.slotOffset) }
             .map { OAI.Thread(id: $0, brightness: 0, effect: .off) }
         _ = try? await device.callAsync(OAI.methodThreads, params: OAI.threadsParams(threads))
         if configuration.driveAmbient {
@@ -441,6 +608,25 @@ public final class BridgeController: ObservableObject {
         await forceRepaint()
     }
 
+    public func performControl(_ action: SessionControlAction, text: String = "") async throws {
+        guard isRunning, !isBusy, configuration.provider == .cmux else { throw SessionProviderError.unavailableSession }
+        if onControlOverride?(action) == true { return }
+        if action == .toggleDialMode { dialControlsWorkspaces.toggle(); return }
+        if action == .commands { onShowCommands?(); return }
+        guard let destination = provider as? any SessionControlProvider else { throw SessionProviderError.unsupportedInput }
+        let resolved: SessionControlAction = dialControlsWorkspaces && action == .nextTab ? .nextWorkspace
+            : dialControlsWorkspaces && action == .previousTab ? .previousWorkspace : action
+        try await destination.performControl(resolved, text: text)
+        lastError = nil
+    }
+
+    public func executeCmuxCommand(_ text: String, layerID: String) async throws {
+        guard isRunning, !isBusy, configuration.selectedLayerID == layerID,
+              let destination = provider as? any SessionControlProvider else { throw SessionProviderError.unavailableSession }
+        try await destination.executeCommand(text)
+        lastError = nil
+    }
+
     public var inputCapabilities: SessionInputCapabilities {
         (provider as? any SessionInputProvider)?.inputCapabilities ?? SessionInputCapabilities()
     }
@@ -454,6 +640,17 @@ public final class BridgeController: ObservableObject {
         try await destination.sendInput(input, to: session)
     }
 
+    public func cmuxWorkspaces(using settings: SessionConfiguration) async throws -> [AgentSession] {
+        try await CmuxClient(settings: settings.cmux).workspaces()
+    }
+
+    public func setCmuxScope(_ scope: CmuxSessionScope, workspaceID: String) async {
+        guard configuration.provider == .cmux else { return }
+        var next = configuration
+        next.cmux.scope = scope; next.cmux.workspaceID = workspaceID
+        await saveConfiguration(next)
+    }
+
     public func noteError(_ message: String) { lastError = message }
     public func startDemo() async {
         guard !isBusy else { return }
@@ -462,6 +659,7 @@ public final class BridgeController: ObservableObject {
         await inspectDevice()
         guard lastError == nil else { return }
         var next = configuration
+        next.layers = [configuration.selectedLayer]
         next.provider = .demo; next.target = availableLayers.first?.target
         next.selection = .recent; next.pinnedSessions = [:]
         next.sessionKeys = Pad.agentKeyIDs

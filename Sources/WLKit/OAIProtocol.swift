@@ -189,6 +189,7 @@ public enum Pad {
     /// to the AG codes above 12 turns rotations and deflections into the same
     /// `v.oai.hid` reports. These IDs never light — nothing is under them.
     public static let dialUpID = 13     // encoder, clockwise detent
+    public static let dialPressID = 19
     public static let dialDownID = 14   // encoder, counter-clockwise detent
     /// The joystick's four cardinal sectors, named by the angle fraction at
     /// their centre in the radial map (0 = east, counter-clockwise).
@@ -196,6 +197,19 @@ public enum Pad {
     public static let joyWestID = 16    // sector centred on 0.5
     public static let joySouthID = 17   // sector centred on 0.75
     public static let joyEastID = 18    // sector centred on 0.0
+
+    public static func inputTitle(_ input: Int) -> String {
+        switch input {
+        case Pad.dialUpID: return "Dial clockwise"
+        case Pad.dialDownID: return "Dial counterclockwise"
+        case Pad.dialPressID: return "Dial press"
+        case Pad.joyNorthID: return "Joystick up"
+        case Pad.joyWestID: return "Joystick left"
+        case Pad.joySouthID: return "Joystick down"
+        case Pad.joyEastID: return "Joystick right"
+        default: return "Key \(input)"
+        }
+    }
 
     public enum JoystickDirection {
         case north, south, east, west

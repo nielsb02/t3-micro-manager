@@ -7,6 +7,8 @@ struct MenuPanelView: View {
     @EnvironmentObject var bridge: BridgeController
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var inspectorError: String?
+    @StateObject private var workspaceLoader = CmuxWorkspaceLoader()
+    @State private var changingCmuxView = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -16,6 +18,10 @@ struct MenuPanelView: View {
                 permissionBanner
             } else {
                 padSection
+                if bridge.configuration.provider == .cmux {
+                    Divider()
+                    cmuxViewSection
+                }
                 if bridge.isRunning {
                     Divider()
                     sessionSection
@@ -31,6 +37,9 @@ struct MenuPanelView: View {
             footer
         }
         .frame(width: 340)
+        .task(id: workspaceLoader.requestID(for: bridge.configuration)) {
+            await workspaceLoader.load(bridge.configuration, using: bridge)
+        }
     }
 
     private var header: some View {
@@ -39,6 +48,10 @@ struct MenuPanelView: View {
                 Text("Micro Manager").font(.headline)
                 Text(bridge.configuration.provider.title + " · " + subtitle)
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                if bridge.configuration.layers.count > 1 {
+                    Text(bridge.configuration.selectedLayer.name)
+                        .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             Spacer()
             Toggle("Enable Micro Manager", isOn: Binding(
@@ -133,6 +146,51 @@ struct MenuPanelView: View {
                 .frame(height: min(CGFloat(bridge.sessions.count) * 30, 210))
                 .padding(.bottom, 7)
             }
+        }
+    }
+
+    private var cmuxViewSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Show on cmux keys").font(.caption).fontWeight(.medium)
+                Spacer()
+                Text("\(bridge.configuration.sessionKeys.count) keys")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            HStack {
+                Button("Voice commands…") { CmuxCommandWindowController.shared.show(bridge) }
+                    .disabled(!bridge.isRunning)
+                Spacer()
+                Button(bridge.dialControlsWorkspaces ? "Dial: workspaces" : "Dial: tabs") {
+                    Task { try? await bridge.performControl(.toggleDialMode) }
+                }.disabled(!bridge.isRunning)
+            }
+            CmuxViewSelector(
+                scope: bridge.configuration.cmux.scope,
+                workspaceID: bridge.configuration.cmux.workspaceID,
+                workspaces: workspaceLoader.workspaces,
+                isLoading: workspaceLoader.isLoading,
+                error: workspaceLoader.error,
+                compact: true,
+                onSelect: changeCmuxView,
+                onRefresh: { workspaceLoader.refresh() }
+            )
+        }
+        .padding(14)
+        .disabled(bridge.isBusy || changingCmuxView)
+    }
+
+    private func changeCmuxView(_ scope: CmuxSessionScope, workspaceID: String) {
+        guard !changingCmuxView, !bridge.isBusy else { return }
+        guard scope != .workspace || !workspaceID.isEmpty else {
+            workspaceLoader.error = "No workspace is available. Open a workspace in cmux, then refresh."
+            return
+        }
+        changingCmuxView = true
+        workspaceLoader.error = nil
+        Task { @MainActor in
+            await bridge.setCmuxScope(scope, workspaceID: workspaceID)
+            changingCmuxView = false
         }
     }
 
