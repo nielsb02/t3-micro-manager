@@ -50,9 +50,12 @@ def local_origin(raw, *, pairing=False):
         raise SetupError("Expected a local T3 loopback address.") from None
 
 
-def request_json(endpoint, path, *, token=None, form=None):
+def request_json(endpoint, path, *, token=None, form=None, orchestration=False):
     endpoint = local_origin(endpoint)
     headers = {"Accept": "application/json"}
+    if orchestration:
+        # Orchestration V2 servers answer HTTP 400 to orchestration reads without this header.
+        headers["x-t3-orchestration-protocol"] = "2"
     if token:
         headers["Authorization"] = f"Bearer {token}"
     body = None
@@ -169,7 +172,7 @@ def exchange(endpoint, credential):
 
 
 def session_count(endpoint, token):
-    shell = request_json(endpoint, "/api/orchestration/shell", token=token)
+    shell = request_json(endpoint, "/api/orchestration/shell", token=token, orchestration=True)
     threads = shell.get("threads")
     if not isinstance(threads, list) or not all(isinstance(thread, dict) for thread in threads):
         raise SetupError("T3's session response has an unsupported format.")

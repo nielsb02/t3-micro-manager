@@ -58,4 +58,4 @@ PY
 
 swiftc -parse-as-library -I .build/debug -I .build/debug/Modules "$t3_temp/Checks.swift" \
     .build/debug/WLKit.build/*.o -o "$t3_temp/check"
-"$t3_temp/check"
+T3_FIXTURE_DIR="$t3_repo/Tests/WLKitTests/Fixtures" "$t3_temp/check"

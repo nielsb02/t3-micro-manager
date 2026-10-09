@@ -56,7 +56,10 @@ thread IDs, never Micro Manager's bearer credential. An authenticated browser
 can then open the exact session when you press its key. It may open a new tab on
 each press, according to your browser's behavior.
 
-T3 compatibility was checked against 0.0.38. The session API is internal and may
+Session status is read from T3 Code's Orchestration V2 server (shell
+`schemaVersion` 2, requested with the `x-t3-orchestration-protocol: 2` header);
+servers that predate V2, such as 0.0.38, are no longer read by the HTTP client. The
+desktop-opening patch below still targets 0.0.38. The session API is internal and may
 change. Expired/revoked credentials require pairing again. Remote environments
 are deferred; this version lists the configured server's own sessions.
 
