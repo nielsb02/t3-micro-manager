@@ -68,10 +68,35 @@ final class T3ClientTests: XCTestCase {
             thread("parent", status: "running", extra: ["lineage": lineage(parent: nil, relationship: nil)]),
             thread("child", status: "running", extra: ["lineage": lineage(parent: "parent", relationship: "subagent")]),
             thread("fork", status: "running", extra: ["lineage": lineage(parent: "parent", relationship: "fork")]),
+            thread("side-chat", status: "running",
+                   extra: ["lineage": lineage(parent: "parent", relationship: "fork"), "sideChat": true]),
             thread("unknown-lineage"),
         ])
         XCTAssertEqual(sessions.map(\.id), ["parent", "fork", "unknown-lineage"])
         XCTAssertNil(sessions.first { $0.id == "child" })
+    }
+
+    func testOpenSideChatsLiftTheirMainThreadsStatus() throws {
+        func sideChat(_ id: String, status: String, extra: [String: Any] = [:]) -> [String: Any] {
+            thread(id, status: status, extra: [
+                "lineage": lineage(parent: "main", relationship: "fork"), "sideChat": true,
+            ].merging(extra, uniquingKeysWith: { _, new in new }))
+        }
+        func mainStatus(_ sideChats: [[String: Any]]) throws -> SessionStatus? {
+            try parse([thread("main", status: "completed")] + sideChats).first { $0.id == "main" }?.status
+        }
+        XCTAssertEqual(try mainStatus([]), .done)
+        XCTAssertEqual(try mainStatus([sideChat("side-working", status: "running")]), .working)
+        XCTAssertEqual(try mainStatus([
+            sideChat("side-working", status: "running"),
+            sideChat("side-asking", status: "running", extra: ["pendingRuntimeRequest": ["id": "request"]]),
+        ]), .blocked)
+        // Closed and finished side chats leave the main thread's own status alone.
+        XCTAssertEqual(try mainStatus([
+            sideChat("side-closed", status: "running", extra: ["archivedAt": "2026-09-06T10:00:00Z"]),
+            sideChat("side-done", status: "completed"),
+        ]), .done)
+        XCTAssertEqual(try parse([thread("main"), sideChat("side-working", status: "running")]).map(\.id), ["main"])
     }
 
     func testSessionMetadataUsesMeaningfulActivityAndWorktreeDirectory() throws {

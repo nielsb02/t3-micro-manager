@@ -127,18 +127,26 @@ public enum T3Error: LocalizedError {
               shell.threads.allSatisfy({ !$0.id.isEmpty && !$0.title.isEmpty }),
               Set(shell.threads.map(\.id)).count == shell.threads.count else { throw T3Error.badResponse }
         let directories = Dictionary(shell.projects.map { ($0.id, $0.workspaceRoot) }, uniquingKeysWith: { first, _ in first })
-        // Like T3's desktop feed, subagent threads never occupy a key.
+        // Like T3's desktop feed, subagent threads and side chats never occupy a key.
         let visible = shell.threads.filter {
             $0.archivedAt == nil && $0.deletedAt == nil && $0.lineage?.relationshipToParent != "subagent"
+                && $0.sideChat != true
         }
         let ranks = sidebarRanks(visible, now: now)
+        // An open side chat that is working or needs the user lifts its main thread's key.
+        var sideChatStatuses: [String: [SessionStatus]] = [:]
+        for thread in shell.threads where thread.sideChat == true && thread.archivedAt == nil && thread.deletedAt == nil {
+            guard let parent = thread.lineage?.parentThreadId else { continue }
+            sideChatStatuses[parent, default: []].append(thread.sessionStatus)
+        }
         return visible.map { thread in
-            AgentSession(id: thread.id, title: thread.title, status: thread.sessionStatus,
-                         updatedAt: thread.latestUserMessageAt ?? thread.latestRunRequestedAt ?? thread.updatedAt ?? "",
-                         isPinned: thread.pinnedAt != nil, environmentID: environmentID,
-                         directory: thread.worktreePath ?? directories[thread.projectId],
-                         completionID: thread.latestRunId ?? thread.latestRunCompletedAt ?? thread.latestRunRequestedAt,
-                         providerOrder: ranks[thread.id])
+            let status = Self.liftedBySideChats(thread.sessionStatus, sideChatStatuses[thread.id] ?? [])
+            return AgentSession(id: thread.id, title: thread.title, status: status,
+                                updatedAt: thread.latestUserMessageAt ?? thread.latestRunRequestedAt ?? thread.updatedAt ?? "",
+                                isPinned: thread.pinnedAt != nil, environmentID: environmentID,
+                                directory: thread.worktreePath ?? directories[thread.projectId],
+                                completionID: thread.latestRunId ?? thread.latestRunCompletedAt ?? thread.latestRunRequestedAt,
+                                providerOrder: ranks[thread.id])
         }
     }
 
@@ -248,7 +256,20 @@ public enum T3Error: LocalizedError {
         let projects: [Project]
     }
     private struct Project: Decodable { let id: String; let workspaceRoot: String }
-    private struct Lineage: Decodable { let relationshipToParent: String? }
+    private struct Lineage: Decodable { let parentThreadId: String?; let relationshipToParent: String? }
+
+    /// Mirrors `withSideChatStatus` in T3's apps/web/src/desktopSessions.ts: needs you outranks
+    /// working, which outranks the main thread's own status.
+    nonisolated static func liftedBySideChats(_ status: SessionStatus, _ sideChats: [SessionStatus]) -> SessionStatus {
+        func rank(_ value: SessionStatus) -> Int {
+            switch value {
+            case .blocked: return 2
+            case .working: return 1
+            default: return 0
+            }
+        }
+        return sideChats.reduce(status) { rank($1) > rank($0) ? $1 : $0 }
+    }
     /// Only its presence matters: any pending runtime request means T3 is waiting on the user.
     private struct PendingRuntimeRequest: Decodable {}
     private struct Thread: Decodable {
@@ -278,6 +299,8 @@ public enum T3Error: LocalizedError {
         let pendingRuntimeRequest: PendingRuntimeRequest?
         let hasActionableProposedPlan: Bool?
         let lineage: Lineage?
+        /// The fork's side chats live inside their main thread's right panel.
+        let sideChat: Bool?
 
         /// Mirrors `desktopSessionStatus` in T3's apps/web/src/desktopSessions.ts.
         var sessionStatus: SessionStatus {
