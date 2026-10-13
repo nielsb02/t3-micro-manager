@@ -133,13 +133,20 @@ public enum T3Error: LocalizedError {
                 && $0.sideChat != true
         }
         let ranks = sidebarRanks(visible, now: now)
+        // An open side chat that is working or needs the user lifts its main thread's key.
+        var sideChatStatuses: [String: [SessionStatus]] = [:]
+        for thread in shell.threads where thread.sideChat == true && thread.archivedAt == nil && thread.deletedAt == nil {
+            guard let parent = thread.lineage?.parentThreadId else { continue }
+            sideChatStatuses[parent, default: []].append(thread.sessionStatus)
+        }
         return visible.map { thread in
-            AgentSession(id: thread.id, title: thread.title, status: thread.sessionStatus,
-                         updatedAt: thread.latestUserMessageAt ?? thread.latestRunRequestedAt ?? thread.updatedAt ?? "",
-                         isPinned: thread.pinnedAt != nil, environmentID: environmentID,
-                         directory: thread.worktreePath ?? directories[thread.projectId],
-                         completionID: thread.latestRunId ?? thread.latestRunCompletedAt ?? thread.latestRunRequestedAt,
-                         providerOrder: ranks[thread.id])
+            let status = Self.liftedBySideChats(thread.sessionStatus, sideChatStatuses[thread.id] ?? [])
+            return AgentSession(id: thread.id, title: thread.title, status: status,
+                                updatedAt: thread.latestUserMessageAt ?? thread.latestRunRequestedAt ?? thread.updatedAt ?? "",
+                                isPinned: thread.pinnedAt != nil, environmentID: environmentID,
+                                directory: thread.worktreePath ?? directories[thread.projectId],
+                                completionID: thread.latestRunId ?? thread.latestRunCompletedAt ?? thread.latestRunRequestedAt,
+                                providerOrder: ranks[thread.id])
         }
     }
 
@@ -249,7 +256,20 @@ public enum T3Error: LocalizedError {
         let projects: [Project]
     }
     private struct Project: Decodable { let id: String; let workspaceRoot: String }
-    private struct Lineage: Decodable { let relationshipToParent: String? }
+    private struct Lineage: Decodable { let parentThreadId: String?; let relationshipToParent: String? }
+
+    /// Mirrors `withSideChatStatus` in T3's apps/web/src/desktopSessions.ts: needs you outranks
+    /// working, which outranks the main thread's own status.
+    nonisolated static func liftedBySideChats(_ status: SessionStatus, _ sideChats: [SessionStatus]) -> SessionStatus {
+        func rank(_ value: SessionStatus) -> Int {
+            switch value {
+            case .blocked: return 2
+            case .working: return 1
+            default: return 0
+            }
+        }
+        return sideChats.reduce(status) { rank($1) > rank($0) ? $1 : $0 }
+    }
     /// Only its presence matters: any pending runtime request means T3 is waiting on the user.
     private struct PendingRuntimeRequest: Decodable {}
     private struct Thread: Decodable {
