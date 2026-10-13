@@ -10,6 +10,13 @@ The APIs below exist in the release tag matching the installed version. This is 
 
 ## Confirmed status interface
 
+> **Superseded for current T3 Code (Orchestration V2).** The shell is requested with the
+> `x-t3-orchestration-protocol: 2` header (HTTP 400 without it) and returns `schemaVersion: 2`
+> threads with a single run `status` (`idle`, `preparing`, `queued`, `starting`, `running`,
+> `waiting`, `completed`, `failed`, `cancelled`, `interrupted`, `rolled_back`),
+> `pendingRuntimeRequest`, `latestRunId`, `latestRunCompletedAt` and `lineage`, and no longer has
+> `session`, `latestTurn` or `backgroundLiveness`. The 0.0.38 description below is kept as history.
+
 T3 exposes an authenticated `GET /api/orchestration/shell` returning project and thread summaries. This is a particularly good fit: the bridge can obtain identifiers, titles and status without downloading conversation messages. The full snapshot and per-thread detail endpoints also exist but are unnecessary for LEDs. [HTTP contracts at v0.0.38](https://github.com/pingdotgg/t3code/blob/v0.0.38/packages/contracts/src/environmentHttp.ts)
 
 A thread summary includes:

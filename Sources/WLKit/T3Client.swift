@@ -17,7 +17,15 @@ public enum T3Error: LocalizedError {
 }
 
 /// The local T3 server's shell endpoint contains session summaries without chat messages.
+///
+/// Speaks T3 Code's Orchestration V2 protocol: every orchestration request carries
+/// `x-t3-orchestration-protocol: 2`, and the shell snapshot (`schemaVersion` 2) reports
+/// each thread's run `status` directly instead of V1's `session` / `latestTurn` pair.
 @MainActor public final class T3Client {
+    nonisolated static let orchestrationProtocolHeader = "x-t3-orchestration-protocol"
+    nonisolated static let orchestrationProtocolVersion = "2"
+    nonisolated static let shellSchemaVersion = 2
+
     private var settings: T3ConnectionSettings
     private let transport: URLSession
     private var discoveredEnvironmentID: String?
@@ -48,7 +56,7 @@ public enum T3Error: LocalizedError {
             environmentID = descriptor.environmentId
             discoveredEnvironmentID = environmentID
         }
-        return try Self.parseShell(data: await request(path: "/api/orchestration/shell"), environmentID: environmentID)
+        return try Self.parseShell(data: await request(path: "/api/orchestration/shell", orchestrationProtocol: true), environmentID: environmentID)
     }
 
     /// A browser must pair separately. The manager's bearer credential is never put in a URL.
@@ -115,18 +123,22 @@ public enum T3Error: LocalizedError {
 
     public nonisolated static func parseShell(data: Data, environmentID: String, now: Date = Date()) throws -> [AgentSession] {
         guard let shell = try? JSONDecoder().decode(Shell.self, from: data),
+              shell.schemaVersion == nil || shell.schemaVersion == shellSchemaVersion,
               shell.threads.allSatisfy({ !$0.id.isEmpty && !$0.title.isEmpty }),
               Set(shell.threads.map(\.id)).count == shell.threads.count else { throw T3Error.badResponse }
         let directories = Dictionary(shell.projects.map { ($0.id, $0.workspaceRoot) }, uniquingKeysWith: { first, _ in first })
-        let visible = shell.threads.filter { $0.archivedAt == nil && $0.deletedAt == nil }
+        // Like T3's desktop feed, subagent threads never occupy a key.
+        let visible = shell.threads.filter {
+            $0.archivedAt == nil && $0.deletedAt == nil && $0.lineage?.relationshipToParent != "subagent"
+        }
         let ranks = sidebarRanks(visible, now: now)
         return visible.map { thread in
-            AgentSession(id: thread.id, title: thread.title, status: thread.status,
-                         updatedAt: thread.latestUserMessageAt ?? thread.latestTurn?.requestedAt ?? thread.updatedAt,
+            AgentSession(id: thread.id, title: thread.title, status: thread.sessionStatus,
+                         updatedAt: thread.latestUserMessageAt ?? thread.latestRunRequestedAt ?? thread.updatedAt ?? "",
                          isPinned: thread.pinnedAt != nil, environmentID: environmentID,
                          directory: thread.worktreePath ?? directories[thread.projectId],
-                         completionID: thread.latestTurn?.turnId ?? thread.latestTurn?.completedAt
-                            ?? thread.latestTurn?.requestedAt, providerOrder: ranks[thread.id])
+                         completionID: thread.latestRunId ?? thread.latestRunCompletedAt ?? thread.latestRunRequestedAt,
+                         providerOrder: ranks[thread.id])
         }
     }
 
@@ -146,12 +158,12 @@ public enum T3Error: LocalizedError {
         let active = threads.filter { thread in
             guard thread.settledOverride != "settled" else { return false }
             guard let wake = timestamp(thread.snoozedUntil), wake > now.timeIntervalSince1970 else { return true }
-            // Pending input, fresh errors and completions wake snoozed threads early in T3.
-            if thread.hasPendingApprovals || thread.hasPendingUserInput { return true }
-            if thread.session?.status == "error",
-               thread.snoozedAt == nil || newer(thread.session?.updatedAt, than: thread.snoozedAt) { return true }
-            return thread.latestTurn?.state == "completed"
-                && newer(thread.latestTurn?.completedAt, than: thread.snoozedAt)
+            // Pending input, fresh failures and completions wake snoozed threads early in T3.
+            if thread.pendingRuntimeRequest != nil { return true }
+            if thread.status == "failed",
+               thread.snoozedAt == nil || newer(thread.updatedAt, than: thread.snoozedAt) { return true }
+            return thread.status == "completed"
+                && newer(thread.latestRunCompletedAt, than: thread.snoozedAt)
         }.map { thread in
             (thread: thread,
              key: thread.pinnedAt != nil ? thread.pinOrderKey : thread.activeOrderKey,
@@ -185,11 +197,15 @@ public enum T3Error: LocalizedError {
     }
 
     private func request(path: String, authenticated: Bool = true, body: Data? = nil,
-                         contentType: String? = nil) async throws -> Data {
+                         contentType: String? = nil, orchestrationProtocol: Bool = false) async throws -> Data {
         let url = try baseURL().appendingPathComponent(String(path.dropFirst()))
         // Session status is live state; cached shell snapshots can leave LEDs stale.
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        // V2 servers reject orchestration reads (HTTP 400) without the protocol header.
+        if orchestrationProtocol {
+            request.setValue(Self.orchestrationProtocolVersion, forHTTPHeaderField: Self.orchestrationProtocolHeader)
+        }
         if authenticated && !settings.bearerToken.isEmpty {
             request.setValue("Bearer \(settings.bearerToken)", forHTTPHeaderField: "Authorization")
         }
@@ -226,22 +242,28 @@ public enum T3Error: LocalizedError {
 
     private struct Descriptor: Decodable { let environmentId: String }
     private struct TokenResponse: Decodable { let access_token: String; let token_type: String; let scope: String }
-    private struct Shell: Decodable { let threads: [Thread]; let projects: [Project] }
-    private struct Project: Decodable { let id: String; let workspaceRoot: String }
-    private struct Session: Decodable { let status: String; let updatedAt: String? }
-    private struct Turn: Decodable {
-        let turnId: String?
-        let state: String
-        let requestedAt: String?
-        let completedAt: String?
+    private struct Shell: Decodable {
+        let schemaVersion: Int?
+        let threads: [Thread]
+        let projects: [Project]
     }
+    private struct Project: Decodable { let id: String; let workspaceRoot: String }
+    private struct Lineage: Decodable { let relationshipToParent: String? }
+    /// Only its presence matters: any pending runtime request means T3 is waiting on the user.
+    private struct PendingRuntimeRequest: Decodable {}
     private struct Thread: Decodable {
         let id: String
         let projectId: String
         let title: String
+        /// Run status: idle, preparing, queued, starting, running, waiting, completed, failed,
+        /// cancelled, interrupted or rolled_back. Kept as a string so new states stay decodable.
+        let status: String
         let createdAt: String?
-        let updatedAt: String
+        let updatedAt: String?
         let latestUserMessageAt: String?
+        let latestRunId: String?
+        let latestRunRequestedAt: String?
+        let latestRunCompletedAt: String?
         let worktreePath: String?
         let pinnedAt: String?
         let pinOrderKey: String?
@@ -252,22 +274,21 @@ public enum T3Error: LocalizedError {
         let snoozedUntil: String?
         let archivedAt: String?
         let deletedAt: String?
-        let session: Session?
-        let latestTurn: Turn?
-        let hasPendingApprovals: Bool
-        let hasPendingUserInput: Bool
+        let interactionMode: String?
+        let pendingRuntimeRequest: PendingRuntimeRequest?
         let hasActionableProposedPlan: Bool?
-        let backgroundLiveness: String?
+        let lineage: Lineage?
 
-        var status: SessionStatus {
-            if hasPendingApprovals || hasPendingUserInput || hasActionableProposedPlan == true { return .blocked }
-            if session?.status == "error" || latestTurn?.state == "error" { return .error }
-            if ["starting", "running"].contains(session?.status ?? "") || latestTurn?.state == "running"
-                || ["working", "monitoring"].contains(backgroundLiveness ?? "") { return .working }
-            if latestTurn?.state == "interrupted" || ["interrupted", "stopped"].contains(session?.status ?? "") { return .idle }
-            if latestTurn?.state == "completed" { return .done }
-            if session == nil || ["ready", "idle"].contains(session?.status ?? "") { return .idle }
-            return .unknown
+        /// Mirrors `desktopSessionStatus` in T3's apps/web/src/desktopSessions.ts.
+        var sessionStatus: SessionStatus {
+            if pendingRuntimeRequest != nil { return .blocked }
+            switch status {
+            case "preparing", "queued", "starting", "running", "waiting": return .working
+            case "failed": return .error
+            default: break
+            }
+            if hasActionableProposedPlan == true && interactionMode == "plan" { return .blocked }
+            return status == "completed" ? .done : .idle
         }
     }
 }
