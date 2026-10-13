@@ -68,6 +68,8 @@ final class T3ClientTests: XCTestCase {
             thread("parent", status: "running", extra: ["lineage": lineage(parent: nil, relationship: nil)]),
             thread("child", status: "running", extra: ["lineage": lineage(parent: "parent", relationship: "subagent")]),
             thread("fork", status: "running", extra: ["lineage": lineage(parent: "parent", relationship: "fork")]),
+            thread("side-chat", status: "running",
+                   extra: ["lineage": lineage(parent: "parent", relationship: "fork"), "sideChat": true]),
             thread("unknown-lineage"),
         ])
         XCTAssertEqual(sessions.map(\.id), ["parent", "fork", "unknown-lineage"])
