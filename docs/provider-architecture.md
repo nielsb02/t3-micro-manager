@@ -4,6 +4,15 @@
 A provider lists sessions and opens an exact session. It receives application
 connection settings, never a device handle or a physical key mapping.
 
+![Micro Manager architecture: the Creator Micro talks to BridgeController through WLDevice; BridgeController reaches T3 Code, cmux and Herdr through SessionProvider adapters](architecture.svg)
+
+The diagram's source is [architecture.excalidraw](architecture.excalidraw). Open it in
+Excalidraw to edit it, then re-render the image:
+
+```bash
+npx -y mcp-excalidraw-server@2.1.2 render docs/architecture.excalidraw --out docs/architecture.svg
+```
+
 | Component | Responsibility |
 | --- | --- |
 | `AgentSession` / `SessionStatus` | Common session identity, activity, completion revision and status |
